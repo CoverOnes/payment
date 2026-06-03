@@ -115,8 +115,8 @@ func (c *Config) validate() error {
 		errs = append(errs, "PAYMENT_DB_SCHEMA must contain only letters, digits, and underscores")
 	}
 
-	if c.DBMaxConns <= 0 {
-		errs = append(errs, "PAYMENT_DB_MAX_CONNS must be a positive integer (default 10)")
+	if c.DBMaxConns < 0 {
+		errs = append(errs, "PAYMENT_DB_MAX_CONNS must be >= 0 (0 = use default 10)")
 	}
 
 	if c.DBMinConns < 0 {
