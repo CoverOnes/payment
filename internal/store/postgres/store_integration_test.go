@@ -545,6 +545,71 @@ func TestAuditStore_ForUpdateWritesPartitionedAudit(t *testing.T) {
 	assert.Equal(t, 1, count, "exactly one audit row expected in partitioned table")
 }
 
+// TestNewPool_ReservedWordSchema verifies that NewPool correctly creates and uses a schema
+// whose name is a PostgreSQL reserved word (e.g. "user"). Without double-quoting the
+// identifier in CREATE SCHEMA and SET search_path, PG returns syntax error 42601.
+//
+// This test covers the fix introduced in pool.go: pgx.Identifier{schema}.Sanitize()
+// produces a properly double-quoted identifier, making reserved words work at runtime.
+func TestNewPool_ReservedWordSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	// "user" is a PostgreSQL reserved word. Before the fix, passing it unquoted produced:
+	//   ERROR: syntax error at or near "user" (SQLSTATE 42601)
+	const reservedWordSchema = "user"
+
+	// NewPool with schema="user": must CREATE SCHEMA "user" and set search_path = "user".
+	pool, err := postgres.NewPoolWithConfig(ctx, dsn, postgres.PoolConfig{
+		Schema:   reservedWordSchema,
+		MaxConns: 4,
+		MinConns: 1,
+	})
+	require.NoError(t, err, "NewPoolWithConfig must succeed for reserved-word schema %q", reservedWordSchema)
+
+	t.Cleanup(pool.Close)
+
+	t.Run("schema user exists in pg_namespace", func(t *testing.T) {
+		const q = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
+		var exists bool
+		require.NoError(t, pool.QueryRow(ctx, q, reservedWordSchema).Scan(&exists))
+		assert.True(t, exists, "schema %q must exist in pg_namespace after NewPool", reservedWordSchema)
+	})
+
+	t.Run("search_path is set to user schema on acquired connections", func(t *testing.T) {
+		// current_schema() returns the first schema in search_path that exists.
+		var currentSchema string
+		require.NoError(t, pool.QueryRow(ctx, "SELECT current_schema()").Scan(&currentSchema))
+		assert.Equal(t, reservedWordSchema, currentSchema, "search_path must point to the %q schema", reservedWordSchema)
+	})
+
+	t.Run("can create and query a table inside the user schema", func(t *testing.T) {
+		// Create the service's main table inside the "user" schema by relying on search_path.
+		// This exercises the full runtime path: schema created, search_path set, table usable.
+		_, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS pool_schema_probe (id SERIAL PRIMARY KEY, label TEXT)`)
+		require.NoError(t, err, "CREATE TABLE in reserved-word schema must succeed")
+
+		_, err = pool.Exec(ctx, `INSERT INTO pool_schema_probe (label) VALUES ('reserved-word-schema-test')`)
+		require.NoError(t, err, "INSERT into reserved-word schema table must succeed")
+
+		const checkQ = `
+			SELECT EXISTS (
+				SELECT 1
+				FROM   information_schema.tables
+				WHERE  table_schema = $1
+				AND    table_name   = 'pool_schema_probe'
+			)`
+
+		var exists bool
+		require.NoError(t, pool.QueryRow(ctx, checkQ, reservedWordSchema).Scan(&exists))
+		assert.True(t, exists, "pool_schema_probe must exist in schema %q", reservedWordSchema)
+	})
+}
+
 // truncMonth returns the first instant of the month containing t (UTC).
 func truncMonth(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
