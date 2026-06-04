@@ -24,7 +24,7 @@ CREATE TABLE settlement_plans (
     total_amount        numeric(14,2) NOT NULL CHECK (total_amount > 0),
     currency            char(3)       NOT NULL DEFAULT 'TWD',
     frozen_party_count  int           NOT NULL CHECK (frozen_party_count > 0),
-    idempotency_key     text          NOT NULL,
+    idempotency_key     varchar(255)  NOT NULL,
     created_at          timestamptz   NOT NULL DEFAULT now(),
     updated_at          timestamptz   NOT NULL DEFAULT now()
 );
@@ -74,7 +74,7 @@ CREATE TABLE settlement_allocations (
                         CHECK (status IN ('PENDING', 'DISBURSED', 'FAILED')),
     -- soft ref to transactions.id after disburse (no FK, code-validated)
     disbursed_tx_id  uuid,
-    idempotency_key  text          NOT NULL,
+    idempotency_key  varchar(255)  NOT NULL,
     created_at       timestamptz   NOT NULL DEFAULT now(),
     updated_at       timestamptz   NOT NULL DEFAULT now()
 );

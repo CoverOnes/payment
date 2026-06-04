@@ -22,13 +22,16 @@ func NewSettlementTxManager(pool *pgxpool.Pool) *SettlementTxManager {
 
 // WithSettlementTx runs fn inside a single Postgres transaction providing
 // transactional access to all three settlement stores.
+// The plan and allocation stores passed to fn are tx-scoped and expose
+// GetByIDForUpdate / ListByPlanIDForUpdate; these methods are unavailable on
+// pool-backed stores, enforcing that FOR UPDATE only runs inside a transaction.
 // If fn returns an error the transaction is rolled back; otherwise it is committed.
 func (m *SettlementTxManager) WithSettlementTx(
 	ctx context.Context,
 	fn func(
 		ctx context.Context,
-		plans store.SettlementPlanStore,
-		allocs store.SettlementAllocationStore,
+		plans store.TxSettlementPlanStore,
+		allocs store.TxSettlementAllocationStore,
 		audit store.SettlementAuditStore,
 	) error,
 ) error {

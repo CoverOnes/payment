@@ -16,9 +16,10 @@ import (
 )
 
 // Type aliases for the settlement tx callback signature.
+// The tx-scoped variants expose GetByIDForUpdate / ListByPlanIDForUpdate.
 type (
-	storePlanStore  = store.SettlementPlanStore
-	storeAllocStore = store.SettlementAllocationStore
+	storePlanStore  = store.TxSettlementPlanStore
+	storeAllocStore = store.TxSettlementAllocationStore
 	storeAuditEntry = store.SettlementAuditStore
 )
 

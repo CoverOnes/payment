@@ -138,3 +138,66 @@ tasks:
         END;
         $$;
         SQL
+
+  partition:create-next-settlement:
+    desc: |
+      Create next month's settlement_audit partition IF NOT EXISTS (idempotent).
+      Run monthly via cron / Kubernetes CronJob before the month rolls over.
+      Mirrors partition:create-next but operates on the settlement_audit parent table.
+      Retention window: 730 days (2-year compliance). Pair with partition:drop-old-settlement.
+      Requires: PAYMENT_POSTGRES_DSN env var.
+    cmds:
+      - |
+        psql "$PAYMENT_POSTGRES_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$
+        DECLARE
+            month_start timestamptz := date_trunc('month', now() + interval '1 month');
+            month_end   timestamptz := month_start + interval '1 month';
+            part_name   text        := 'settlement_audit_p' || to_char(month_start, 'YYYYMM');
+        BEGIN
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS %I PARTITION OF settlement_audit '
+                'FOR VALUES FROM (%L) TO (%L)',
+                part_name, month_start, month_end
+            );
+            RAISE NOTICE 'Partition % ensured', part_name;
+        END;
+        $$;
+        SQL
+
+  partition:drop-old-settlement:
+    desc: |
+      Drop monthly settlement_audit partitions whose upper bound is older than
+      now() - interval '730 days' (2-year compliance window).
+      Mirrors partition:drop-old but operates on the settlement_audit parent table.
+      Identifies candidate partitions via pg_inherits + pg_class + pg_constraint.
+      Idempotent and safe to run repeatedly.
+      Requires: PAYMENT_POSTGRES_DSN env var.
+    cmds:
+      - |
+        psql "$PAYMENT_POSTGRES_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$
+        DECLARE
+            rec record;
+        BEGIN
+            FOR rec IN
+                SELECT c.relname AS part_name
+                FROM   pg_inherits i
+                JOIN   pg_class   c  ON c.oid  = i.inhrelid
+                JOIN   pg_class   p  ON p.oid  = i.inhparent
+                JOIN   pg_constraint con ON con.conrelid = c.oid
+                                        AND con.contype  = 'x'  -- check constraint (partition bound)
+                WHERE  p.relname = 'settlement_audit'
+                  AND  c.relname <> 'settlement_audit_default'
+                  -- The partition bound upper value is stored in pg_get_expr; cast and compare.
+                  AND  (SELECT split_part(
+                               replace(pg_get_expr(con.conbin, con.conrelid), 'occurred_at < ''', ''),
+                               '''', 1)::timestamptz
+                       ) < now() - interval '730 days'
+            LOOP
+                EXECUTE format('DROP TABLE IF EXISTS %I', rec.part_name);
+                RAISE NOTICE 'Dropped old partition %', rec.part_name;
+            END LOOP;
+        END;
+        $$;
+        SQL

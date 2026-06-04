@@ -11,8 +11,9 @@
 -- NO FOREIGN KEY constraints (CONVENTIONS §11 / CLAUDE.md #9).
 -- plan_id and allocation_id are soft uuid refs validated at application layer.
 --
--- event_type examples: PLAN_CREATED, PLAN_COMPLETED, PLAN_CANCELLED,
+-- event_type values: PLAN_CREATED, PLAN_COMPLETED, PLAN_CANCELED,
 --   ALLOCATION_DISBURSED, ALLOCATION_FAILED.
+--   Note: CANCELED (single L) matches the Go domain PlanStatus constant.
 -- actor_service: the service that triggered the event (e.g. "payment", "workspace").
 -- payload: arbitrary JSON for structured event context (amounts, reason, etc.).
 
@@ -22,8 +23,15 @@ CREATE TABLE settlement_audit (
     plan_id        uuid        NOT NULL,
     -- soft ref to settlement_allocations; nullable — plan-level events have no allocation
     allocation_id  uuid,
-    event_type     text        NOT NULL,
-    actor_service  text        NOT NULL,
+    event_type     varchar(64) NOT NULL
+                       CHECK (event_type IN (
+                           'PLAN_CREATED',
+                           'PLAN_COMPLETED',
+                           'PLAN_CANCELED',
+                           'ALLOCATION_DISBURSED',
+                           'ALLOCATION_FAILED'
+                       )),
+    actor_service  varchar(64) NOT NULL,
     payload        jsonb       NOT NULL DEFAULT '{}',
     occurred_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (id, occurred_at)

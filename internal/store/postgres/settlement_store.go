@@ -65,11 +65,6 @@ func (s *SettlementPlanStore) GetByID(ctx context.Context, id uuid.UUID) (*domai
 	return settlementPlanGetByID(ctx, s.q, id)
 }
 
-// GetByIDForUpdate fetches a plan with SELECT ... FOR UPDATE.
-func (s *SettlementPlanStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.SettlementPlan, error) {
-	return settlementPlanGetByIDForUpdate(ctx, s.q, id)
-}
-
 // UpdateStatus updates the status and updated_at of a plan.
 func (s *SettlementPlanStore) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PlanStatus) error {
 	return settlementPlanUpdateStatus(ctx, s.q, id, status)
@@ -248,11 +243,6 @@ func (s *SettlementAllocationStore) GetByID(ctx context.Context, id uuid.UUID) (
 // ListByPlanID returns all allocations for a plan ordered by created_at ASC.
 func (s *SettlementAllocationStore) ListByPlanID(ctx context.Context, planID uuid.UUID) ([]*domain.SettlementAllocation, error) {
 	return settlementAllocationListByPlanID(ctx, s.q, planID, false)
-}
-
-// ListByPlanIDForUpdate returns all allocations for a plan with SELECT ... FOR UPDATE.
-func (s *SettlementAllocationStore) ListByPlanIDForUpdate(ctx context.Context, planID uuid.UUID) ([]*domain.SettlementAllocation, error) {
-	return settlementAllocationListByPlanID(ctx, s.q, planID, true)
 }
 
 // UpdateStatus updates allocation status and optional disbursed_tx_id.

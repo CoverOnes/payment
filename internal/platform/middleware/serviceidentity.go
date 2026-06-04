@@ -13,6 +13,10 @@ const (
 	headerServiceID    = "X-Service-Id"
 	headerServiceToken = "X-Service-Token" // header NAME (not a credential value)
 	ctxKeyServiceID    = "service_id"
+
+	// maxServiceIDLen caps the service identifier to prevent oversized values from
+	// reaching settlement_audit.actor_service (varchar(64)). §5.4 backend-security-design.
+	maxServiceIDLen = 64
 )
 
 // RequireServiceIdentity is a deny-by-default service-to-service (S2S) guard for
@@ -53,9 +57,35 @@ func RequireServiceIdentity(expectedToken string) gin.HandlerFunc {
 			return
 		}
 
+		// Validate service-id length and content before storing in audit (§5.4).
+		// Rejects values that would overflow actor_service varchar(64) or carry
+		// control characters (\x00, \r, \n, \t) that corrupt terminal/log output.
+		if !isValidServiceID(serviceID) {
+			c.Abort()
+			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "service authentication required")
+
+			return
+		}
+
 		c.Set(ctxKeyServiceID, serviceID)
 		c.Next()
 	}
+}
+
+// isValidServiceID returns true when id is within the allowed length and contains
+// no ASCII control characters (\x00, \r, \n, \t). Mirrors §5.4 reason-text rules.
+func isValidServiceID(id string) bool {
+	if len(id) > maxServiceIDLen {
+		return false
+	}
+
+	for _, r := range id {
+		if r == '\x00' || r == '\r' || r == '\n' || r == '\t' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ServiceIDFromCtx returns the authenticated caller service id set by
