@@ -16,6 +16,9 @@ const testDSN = "postgres://user:pass@localhost/db"
 // testHMACSecret is a 32-char placeholder HMAC secret used in tests only — not a real secret.
 const testHMACSecret = "0123456789abcdef0123456789abcdef"
 
+// testS2SToken is a 32-char placeholder S2S token used in tests only — not a real secret.
+const testS2SToken = "abcdef0123456789abcdef0123456789"
+
 // setValidEnv sets the minimum valid environment variables for a development config.
 func setValidEnv(t *testing.T) {
 	t.Helper()
@@ -200,6 +203,10 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", tc.secret)
+			// Non-dev requires S2S token; set it for all cases so HMAC is the only variable.
+			if tc.env == "production" || tc.env == "staging" {
+				t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+			}
 
 			_, err := config.Load()
 			if tc.wantErr {
@@ -227,12 +234,95 @@ func TestIsDev(t *testing.T) {
 		t.Run(tc.env, func(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
-			// Non-dev envs require a gateway HMAC secret (§24.1 fail-closed).
+			// Non-dev envs require gateway HMAC secret (§24.1 fail-closed)
+			// and settlement S2S token (backend-security-design §5.5).
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
+			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
 			assert.Equal(t, tc.isDev, cfg.IsDev(), "IsDev() for env=%s", tc.env)
+		})
+	}
+}
+
+// TestLoad_SettlementS2SToken verifies fail-closed secret posture for PAYMENT_SETTLEMENT_S2S_TOKEN.
+func TestLoad_SettlementS2SToken(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		token     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			// dev: empty token is allowed (endpoint not yet wired in PR1).
+			name:    "dev with empty token is allowed",
+			env:     "development",
+			token:   "",
+			wantErr: false,
+		},
+		{
+			// non-dev: token is required and MUST be ≥32 chars.
+			name:      "production without token fails (fail-closed)",
+			env:       "production",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "PAYMENT_SETTLEMENT_S2S_TOKEN must be at least 32 characters in non-dev",
+		},
+		{
+			name:      "staging without token fails (fail-closed)",
+			env:       "staging",
+			token:     "",
+			wantErr:   true,
+			errSubstr: "PAYMENT_SETTLEMENT_S2S_TOKEN must be at least 32 characters in non-dev",
+		},
+		{
+			// dev: too-short token is rejected (catches typos).
+			name:      "dev with too-short token is rejected",
+			env:       "development",
+			token:     "tooshort",
+			wantErr:   true,
+			errSubstr: "PAYMENT_SETTLEMENT_S2S_TOKEN, when set, must be at least 32 characters",
+		},
+		{
+			name:      "production with too-short token is rejected",
+			env:       "production",
+			token:     "tooshort",
+			wantErr:   true,
+			errSubstr: "PAYMENT_SETTLEMENT_S2S_TOKEN must be at least 32 characters in non-dev",
+		},
+		{
+			name:    "production with valid 32-char token passes",
+			env:     "production",
+			token:   testS2SToken,
+			wantErr: false,
+		},
+		{
+			name:    "dev with valid 32-char token passes",
+			env:     "development",
+			token:   testS2SToken,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("PAYMENT_ENV", tc.env)
+			// Provide the HMAC secret so it doesn't interfere with S2S token tests.
+			if tc.env != "development" {
+				t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
+			}
+			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", tc.token)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
