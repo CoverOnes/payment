@@ -81,7 +81,12 @@ func run() error {
 
 	// Postgres pool (CONVENTIONS §12).
 	// Pass cfg.DBSchema so the pool sets search_path when sharing one Aiven DB across services.
-	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.DBSchema)
+	// Pass cfg.DBMaxConns / cfg.DBMinConns so connection budget is configurable per environment.
+	pool, err := postgres.NewPoolWithConfig(ctx, cfg.PostgresDSN, postgres.PoolConfig{
+		Schema:   cfg.DBSchema,
+		MaxConns: int32(cfg.DBMaxConns),
+		MinConns: int32(cfg.DBMinConns),
+	})
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
