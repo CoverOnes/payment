@@ -135,9 +135,10 @@ func run() error {
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
-		TransactionSvc: txSvc,
-		Pool:           pool,
-		Redis:          redisClient,
+		TransactionSvc:    txSvc,
+		Pool:              pool,
+		Redis:             redisClient,
+		GatewayHMACSecret: cfg.GatewayHMACSecret,
 	})
 
 	srv := &http.Server{
