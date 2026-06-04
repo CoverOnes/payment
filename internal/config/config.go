@@ -33,8 +33,22 @@ type Config struct {
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
-	// Environment: development | production | test
+	// Environment: development | staging | production. REQUIRED — there is no
+	// safe default. An empty or unknown value is a boot error (fail-closed): a
+	// silent default to "production" would mask a misconfigured deploy, and a
+	// silent default to "development" would disable gateway-signature
+	// verification §24.1 (the forged-identity-header hole). Operators MUST set
+	// PAYMENT_ENV explicitly.
 	Env string `mapstructure:"env"`
+
+	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
+	// identity signature (conventions §24.1). It MUST equal the gateway's
+	// GATEWAY_HMAC_SECRET. Non-dev (staging/production) fails fast at boot if
+	// empty or shorter than 32 chars; development may omit it (verification
+	// disabled, mirroring the gateway which also disables signing in dev).
+	// chmod 0600 the file that provides it; prefer the env var as canonical.
+	// Env: PAYMENT_GATEWAY_HMAC_SECRET
+	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
 }
 
 // Load reads configuration from environment variables (prefix PAYMENT_).
@@ -46,12 +60,13 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":         "PAYMENT_PORT",
-		"postgres_dsn": "PAYMENT_POSTGRES_DSN",
-		"db_schema":    "PAYMENT_DB_SCHEMA",
-		"redis_url":    "PAYMENT_REDIS_URL",
-		"log_level":    "PAYMENT_LOG_LEVEL",
-		"env":          "PAYMENT_ENV",
+		"port":                "PAYMENT_PORT",
+		"postgres_dsn":        "PAYMENT_POSTGRES_DSN",
+		"db_schema":           "PAYMENT_DB_SCHEMA",
+		"redis_url":           "PAYMENT_REDIS_URL",
+		"log_level":           "PAYMENT_LOG_LEVEL",
+		"env":                 "PAYMENT_ENV",
+		"gateway_hmac_secret": "PAYMENT_GATEWAY_HMAC_SECRET",
 	}
 
 	for key, envKey := range bindings {
@@ -62,7 +77,10 @@ func Load() (*Config, error) {
 
 	v.SetDefault("port", 8084)
 	v.SetDefault("log_level", "INFO")
-	v.SetDefault("env", "development")
+	// NOTE: PAYMENT_ENV has NO default — it is required and validated
+	// explicitly below. A silent default to "production" would mask a
+	// misconfigured deploy; a default to "development" would disable
+	// gateway-signature verification §24.1. Fail-closed: empty env → boot error.
 
 	var cfg Config
 
@@ -93,9 +111,13 @@ func (c *Config) validate() error {
 		errs = append(errs, "PAYMENT_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR")
 	}
 
-	validEnvs := map[string]bool{"development": true, "production": true, "test": true}
+	// Fail-closed env posture: PAYMENT_ENV MUST be one of the three known
+	// values. Empty (unset) or any unknown string is a boot error — no silent
+	// default. This guards §24.1: a misconfigured env must never silently land
+	// in a posture that disables gateway-signature verification.
+	validEnvs := map[string]bool{"development": true, "staging": true, "production": true}
 	if !validEnvs[strings.ToLower(c.Env)] {
-		errs = append(errs, "PAYMENT_ENV must be development|production|test")
+		errs = append(errs, "PAYMENT_ENV must be explicitly set to development|staging|production")
 	}
 
 	// Validate db_schema: empty is allowed (public/default); non-empty must be [a-zA-Z0-9_]+
@@ -104,11 +126,42 @@ func (c *Config) validate() error {
 		errs = append(errs, "PAYMENT_DB_SCHEMA must contain only letters, digits, and underscores")
 	}
 
+	errs = append(errs, c.validateGatewayHMAC()...)
+
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
 	}
 
 	return nil
+}
+
+// minHMACSecretLen is the minimum length of the gateway HMAC secret. It mirrors
+// the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
+const minHMACSecretLen = 32
+
+// validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
+//   - non-dev (staging/production): secret is REQUIRED and MUST be ≥32 chars —
+//     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
+//   - dev: secret may be empty (verification disabled, mirroring the gateway's
+//     dev signing-skip); but if a secret IS provided it must still be ≥32 chars
+//     so a too-short dev secret never masquerades as a valid one.
+func (c *Config) validateGatewayHMAC() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if len(c.GatewayHMACSecret) < minHMACSecretLen {
+			errs = append(errs, "PAYMENT_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev (staging/production) environments")
+		}
+
+		return errs
+	}
+
+	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
+	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minHMACSecretLen {
+		errs = append(errs, "PAYMENT_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
+	}
+
+	return errs
 }
 
 // IsDev reports whether the service is running in development mode.
