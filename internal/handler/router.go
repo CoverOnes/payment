@@ -15,6 +15,7 @@ import (
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
 	TransactionSvc *service.TransactionService
+	SettlementSvc  *service.SettlementService
 	Pool           *pgxpool.Pool
 	Redis          *redis.Client // may be nil in dev
 
@@ -22,6 +23,10 @@ type RouterConfig struct {
 	// gateway-origin identity signature. Empty == dev posture (verification
 	// disabled); config validation guarantees it is non-empty in non-dev.
 	GatewayHMACSecret string
+
+	// SettlementS2SToken is the shared secret for RequireServiceIdentity on the
+	// settlement disburse endpoint (PAYMENT_SETTLEMENT_S2S_TOKEN).
+	SettlementS2SToken string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -69,6 +74,22 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// Read endpoints — identity required, no tier gate (but IDOR enforced in handler).
 	api.GET("/transactions/:id", txH.GetByID)
 	api.GET("/me/transactions", txH.ListMyTransactions)
+
+	// Settlement endpoints.
+	// POST /v1/settlement/plans/:id/disburse — manual milestone re-trigger.
+	// Gated by:
+	//   1. VerifyGatewaySignature + RequireValidIdentity (inherited from api group)
+	//   2. RequireTier(3) — caller must be KYC Tier 3
+	//   3. RequireServiceIdentity — must present PAYMENT_SETTLEMENT_S2S_TOKEN
+	if cfg.SettlementSvc != nil {
+		settlementH := NewSettlementHandler(cfg.SettlementSvc)
+		settlement := api.Group("/settlement")
+		settlement.POST("/plans/:id/disburse",
+			middleware.RequireTier(3),
+			middleware.RequireServiceIdentity(cfg.SettlementS2SToken),
+			settlementH.Disburse,
+		)
+	}
 
 	return r
 }

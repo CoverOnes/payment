@@ -53,6 +53,14 @@ func (s *txSettlementPlanStore) CountByMultiContractID(ctx context.Context, mult
 	return settlementPlanCountByMultiContractID(ctx, s.tx, multiContractID)
 }
 
+func (s *txSettlementPlanStore) GetByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error) {
+	return settlementPlanGetByMultiContractID(ctx, s.tx, multiContractID)
+}
+
+func (s *txSettlementPlanStore) GetByMultiContractIDForUpdate(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error) {
+	return settlementPlanGetByMultiContractIDForUpdate(ctx, s.tx, multiContractID)
+}
+
 // Pool-backed methods.
 
 // Create inserts a new settlement plan.
@@ -73,6 +81,12 @@ func (s *SettlementPlanStore) UpdateStatus(ctx context.Context, id uuid.UUID, st
 // CountByMultiContractID returns the number of non-canceled plans for a contract.
 func (s *SettlementPlanStore) CountByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (int, error) {
 	return settlementPlanCountByMultiContractID(ctx, s.q, multiContractID)
+}
+
+// GetByMultiContractID returns the active (non-canceled) settlement plan for a contract.
+// Returns nil, nil if no plan exists.
+func (s *SettlementPlanStore) GetByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error) {
+	return settlementPlanGetByMultiContractID(ctx, s.q, multiContractID)
 }
 
 // --- helpers ---
@@ -153,6 +167,47 @@ WHERE multi_contract_id = $1 AND status != 'CANCELED'
 	}
 
 	return count, nil
+}
+
+func settlementPlanGetByMultiContractID(ctx context.Context, q querier, multiContractID uuid.UUID) (*domain.SettlementPlan, error) {
+	const query = `
+SELECT id, multi_contract_id, tender_id, status, total_amount, currency, frozen_party_count, idempotency_key, created_at, updated_at
+FROM settlement_plans
+WHERE multi_contract_id = $1 AND status != 'CANCELED'
+LIMIT 1
+`
+
+	plan, err := scanSettlementPlan(q.QueryRow(ctx, query, multiContractID))
+	if err != nil {
+		if errors.Is(err, domain.ErrPlanNotFound) {
+			return nil, nil //nolint:nilnil // nil,nil means "no plan exists" — intentional absence signal
+		}
+
+		return nil, fmt.Errorf("get settlement_plan by multi_contract_id: %w", err)
+	}
+
+	return plan, nil
+}
+
+func settlementPlanGetByMultiContractIDForUpdate(ctx context.Context, q querier, multiContractID uuid.UUID) (*domain.SettlementPlan, error) {
+	const query = `
+SELECT id, multi_contract_id, tender_id, status, total_amount, currency, frozen_party_count, idempotency_key, created_at, updated_at
+FROM settlement_plans
+WHERE multi_contract_id = $1 AND status != 'CANCELED'
+LIMIT 1
+FOR UPDATE
+`
+
+	plan, err := scanSettlementPlan(q.QueryRow(ctx, query, multiContractID))
+	if err != nil {
+		if errors.Is(err, domain.ErrPlanNotFound) {
+			return nil, nil //nolint:nilnil // nil,nil means "no plan exists" — intentional absence signal
+		}
+
+		return nil, fmt.Errorf("get settlement_plan by multi_contract_id for update: %w", err)
+	}
+
+	return plan, nil
 }
 
 func scanSettlementPlan(row rowScanner) (*domain.SettlementPlan, error) {

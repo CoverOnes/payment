@@ -19,6 +19,9 @@ const testHMACSecret = "0123456789abcdef0123456789abcdef"
 // testS2SToken is a 32-char placeholder S2S token used in tests only — not a real secret.
 const testS2SToken = "abcdef0123456789abcdef0123456789"
 
+// testWorkspaceToken is a 32-char placeholder workspace S2S token for tests only — not a real secret.
+const testWorkspaceToken = "workspace0123456789abcdef0123456"
+
 // setValidEnv sets the minimum valid environment variables for a development config.
 func setValidEnv(t *testing.T) {
 	t.Helper()
@@ -203,9 +206,11 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", tc.secret)
-			// Non-dev requires S2S token; set it for all cases so HMAC is the only variable.
+			// Non-dev requires S2S token + workspace config; set them so HMAC is the only variable.
 			if tc.env == "production" || tc.env == "staging" {
 				t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+				t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
 			}
 
 			_, err := config.Load()
@@ -234,10 +239,13 @@ func TestIsDev(t *testing.T) {
 		t.Run(tc.env, func(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
-			// Non-dev envs require gateway HMAC secret (§24.1 fail-closed)
-			// and settlement S2S token (backend-security-design §5.5).
+			// Non-dev envs require gateway HMAC secret (§24.1 fail-closed),
+			// settlement S2S token (backend-security-design §5.5),
+			// and workspace config (PAYMENT_WORKSPACE_BASE_URL + PAYMENT_WORKSPACE_S2S_TOKEN).
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
 			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+			t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
@@ -310,11 +318,94 @@ func TestLoad_SettlementS2SToken(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
-			// Provide the HMAC secret so it doesn't interfere with S2S token tests.
+			// Provide the HMAC secret + workspace config so they don't interfere with S2S token tests.
 			if tc.env != "development" {
 				t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
+				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+				t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
 			}
 			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", tc.token)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_WorkspaceConfig verifies fail-closed posture for workspace S2S config.
+func TestLoad_WorkspaceConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		env            string
+		baseURL        string
+		workspaceToken string
+		wantErr        bool
+		errSubstr      string
+	}{
+		{
+			name:           "dev: empty workspace config allowed",
+			env:            "development",
+			baseURL:        "",
+			workspaceToken: "",
+			wantErr:        false,
+		},
+		{
+			name:           "production: missing base URL fails",
+			env:            "production",
+			baseURL:        "",
+			workspaceToken: testWorkspaceToken,
+			wantErr:        true,
+			errSubstr:      "PAYMENT_WORKSPACE_BASE_URL is required",
+		},
+		{
+			name:           "production: missing workspace token fails",
+			env:            "production",
+			baseURL:        "http://workspace:8081",
+			workspaceToken: "",
+			wantErr:        true,
+			errSubstr:      "PAYMENT_WORKSPACE_S2S_TOKEN must be at least 32 characters",
+		},
+		{
+			name:           "production: too-short workspace token fails",
+			env:            "production",
+			baseURL:        "http://workspace:8081",
+			workspaceToken: "tooshort",
+			wantErr:        true,
+			errSubstr:      "PAYMENT_WORKSPACE_S2S_TOKEN must be at least 32 characters",
+		},
+		{
+			name:           "production: valid workspace config passes",
+			env:            "production",
+			baseURL:        "http://workspace:8081",
+			workspaceToken: testWorkspaceToken,
+			wantErr:        false,
+		},
+		{
+			name:           "dev: too-short workspace token fails even in dev",
+			env:            "development",
+			baseURL:        "http://localhost:8081",
+			workspaceToken: "tooshort",
+			wantErr:        true,
+			errSubstr:      "PAYMENT_WORKSPACE_S2S_TOKEN, when set, must be at least 32 characters",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("PAYMENT_ENV", tc.env)
+			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", tc.baseURL)
+			t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", tc.workspaceToken)
+
+			if tc.env != "development" {
+				t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
+				t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+			}
 
 			_, err := config.Load()
 			if tc.wantErr {

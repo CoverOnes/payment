@@ -60,11 +60,25 @@ type Config struct {
 	// SettlementS2SToken is the shared secret used by the S2S middleware on the
 	// settlement disburse endpoint (backend-security-design §5.5).
 	// Trusted internal callers (workspace service) MUST present this token in
-	// X-Service-Token. The endpoint is not yet wired to any route (PR2).
+	// X-Service-Token.
 	// Non-dev (staging/production): REQUIRED, MUST be ≥32 chars.
-	// Dev: may be empty (endpoint not wired anyway); if set must be ≥32 chars.
+	// Dev: may be empty; if set must be ≥32 chars.
 	// Env: PAYMENT_SETTLEMENT_S2S_TOKEN
 	SettlementS2SToken string `mapstructure:"settlement_s2s_token"`
+
+	// WorkspaceBaseURL is the base URL of the workspace service used for S2S calls
+	// (e.g. fetching the frozen party roster at plan creation).
+	// Non-dev (staging/production): REQUIRED, must be a non-empty URL.
+	// Dev: may be empty (consumers still subscribe to Redis; S2S call will fail if called).
+	// Env: PAYMENT_WORKSPACE_BASE_URL
+	WorkspaceBaseURL string `mapstructure:"workspace_base_url"`
+
+	// WorkspaceS2SToken is the shared secret sent in X-Service-Token when calling
+	// workspace internal endpoints (e.g. GET /internal/v1/contracts/:id/parties).
+	// Non-dev (staging/production): REQUIRED, MUST be ≥32 chars.
+	// Dev: may be empty; if set must be ≥32 chars.
+	// Env: PAYMENT_WORKSPACE_S2S_TOKEN
+	WorkspaceS2SToken string `mapstructure:"workspace_s2s_token"`
 }
 
 // Load reads configuration from environment variables (prefix PAYMENT_).
@@ -86,6 +100,8 @@ func Load() (*Config, error) {
 		"env":                  "PAYMENT_ENV",
 		"gateway_hmac_secret":  "PAYMENT_GATEWAY_HMAC_SECRET",
 		"settlement_s2s_token": "PAYMENT_SETTLEMENT_S2S_TOKEN",
+		"workspace_base_url":   "PAYMENT_WORKSPACE_BASE_URL",
+		"workspace_s2s_token":  "PAYMENT_WORKSPACE_S2S_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -161,6 +177,7 @@ func (c *Config) validate() error {
 
 	errs = append(errs, c.validateGatewayHMAC()...)
 	errs = append(errs, c.validateSettlementS2SToken()...)
+	errs = append(errs, c.validateWorkspace()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -210,7 +227,7 @@ const minS2STokenLen = 32
 // validateSettlementS2SToken enforces the fail-closed secret posture for the
 // settlement S2S token (backend-security-design §5.5):
 //   - non-dev (staging/production): REQUIRED and MUST be ≥32 chars.
-//   - dev: may be empty (endpoint not yet wired in PR1); if set must be ≥32 chars.
+//   - dev: may be empty; if set must be ≥32 chars.
 func (c *Config) validateSettlementS2SToken() []string {
 	var errs []string
 
@@ -225,6 +242,32 @@ func (c *Config) validateSettlementS2SToken() []string {
 	// Dev: empty is allowed; non-empty must be ≥32.
 	if c.SettlementS2SToken != "" && len(c.SettlementS2SToken) < minS2STokenLen {
 		errs = append(errs, "PAYMENT_SETTLEMENT_S2S_TOKEN, when set, must be at least 32 characters")
+	}
+
+	return errs
+}
+
+// validateWorkspace enforces the fail-closed posture for workspace S2S config:
+//   - non-dev (staging/production): WorkspaceBaseURL and WorkspaceS2SToken are REQUIRED.
+//   - dev: may be empty (integration tests mock the workspace endpoint).
+func (c *Config) validateWorkspace() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if c.WorkspaceBaseURL == "" {
+			errs = append(errs, "PAYMENT_WORKSPACE_BASE_URL is required in non-dev (staging/production) environments")
+		}
+
+		if len(c.WorkspaceS2SToken) < minS2STokenLen {
+			errs = append(errs, "PAYMENT_WORKSPACE_S2S_TOKEN must be at least 32 characters in non-dev (staging/production) environments")
+		}
+
+		return errs
+	}
+
+	// Dev: if set, WorkspaceS2SToken must be ≥32.
+	if c.WorkspaceS2SToken != "" && len(c.WorkspaceS2SToken) < minS2STokenLen {
+		errs = append(errs, "PAYMENT_WORKSPACE_S2S_TOKEN, when set, must be at least 32 characters")
 	}
 
 	return errs

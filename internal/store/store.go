@@ -51,6 +51,9 @@ type SettlementPlanStore interface {
 	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PlanStatus) error
 	// CountByMultiContractID returns the number of non-canceled plans for a contract.
 	CountByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (int, error)
+	// GetByMultiContractID returns the active (non-canceled) settlement plan for a contract.
+	// Returns nil, nil if no plan exists.
+	GetByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error)
 }
 
 // SettlementAllocationStore defines persistence operations for settlement allocations.
@@ -84,6 +87,9 @@ type TxSettlementPlanStore interface {
 	// GetByIDForUpdate fetches a plan with SELECT ... FOR UPDATE inside a DB transaction.
 	// Used by the disburse service to lock the plan before checking/updating allocations (TOCTOU).
 	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.SettlementPlan, error)
+	// GetByMultiContractIDForUpdate fetches the active plan for a contract with FOR UPDATE.
+	// Used by the disburse service when the plan_id is unknown and must be resolved under lock.
+	GetByMultiContractIDForUpdate(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error)
 }
 
 // TxSettlementAllocationStore extends SettlementAllocationStore with SELECT ... FOR UPDATE,
