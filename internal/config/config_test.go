@@ -621,6 +621,62 @@ func TestLoad_PlatformUserID(t *testing.T) {
 	}
 }
 
+// TestLoad_UserRateLimit verifies validateUserRateLimit: perMin<0 rejected, burst<=0 with
+// perMin>0 rejected, perMin=0 disabled (pass without burst), and a valid enabled case.
+func TestLoad_UserRateLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		perMin    string
+		burst     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:      "perMin<0 is rejected",
+			perMin:    "-1",
+			burst:     "10",
+			wantErr:   true,
+			errSubstr: "PAYMENT_USER_RATE_LIMIT_PER_MIN must be >= 0",
+		},
+		{
+			name:      "perMin>0 with burst<=0 is rejected",
+			perMin:    "60",
+			burst:     "0",
+			wantErr:   true,
+			errSubstr: "PAYMENT_USER_RATE_LIMIT_BURST must be > 0",
+		},
+		{
+			// perMin=0 disables the per-user limiter; burst is irrelevant and not validated.
+			name:    "perMin=0 disabled passes regardless of burst",
+			perMin:  "0",
+			burst:   "0",
+			wantErr: false,
+		},
+		{
+			name:    "valid perMin>0 and burst>0 passes",
+			perMin:  "120",
+			burst:   "20",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("PAYMENT_USER_RATE_LIMIT_PER_MIN", tc.perMin)
+			t.Setenv("PAYMENT_USER_RATE_LIMIT_BURST", tc.burst)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // TestLoad_Redis_Auth verifies validateRedis (sec MAJOR-2): non-dev requires auth + TLS.
 func TestLoad_Redis_Auth(t *testing.T) {
 	tests := []struct {

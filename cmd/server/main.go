@@ -173,13 +173,15 @@ func run() error {
 	}
 
 	// Router.
-	r := handler.NewRouter(handler.RouterConfig{
-		TransactionSvc:     txSvc,
-		SettlementSvc:      settlementSvc,
-		Pool:               pool,
-		Redis:              redisClient,
-		GatewayHMACSecret:  cfg.GatewayHMACSecret,
-		SettlementS2SToken: cfg.SettlementS2SToken,
+	r := handler.NewRouter(&handler.RouterConfig{
+		TransactionSvc:      txSvc,
+		SettlementSvc:       settlementSvc,
+		Pool:                pool,
+		Redis:               redisClient,
+		GatewayHMACSecret:   cfg.GatewayHMACSecret,
+		SettlementS2SToken:  cfg.SettlementS2SToken,
+		UserRateLimitPerMin: cfg.UserRateLimitPerMin,
+		UserRateLimitBurst:  cfg.UserRateLimitBurst,
 	})
 
 	srv := &http.Server{

@@ -27,6 +27,14 @@ type RouterConfig struct {
 	// SettlementS2SToken is the shared secret for RequireServiceIdentity on the
 	// settlement disburse endpoint (PAYMENT_SETTLEMENT_S2S_TOKEN).
 	SettlementS2SToken string
+
+	// UserRateLimitPerMin is the per-authenticated-user request budget per minute
+	// for the /v1 group. 0 disables the per-user limiter (IP-level still applies).
+	UserRateLimitPerMin int
+
+	// UserRateLimitBurst is the token-bucket burst allowance for the per-user limiter.
+	// Ignored when UserRateLimitPerMin is 0.
+	UserRateLimitBurst int
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -34,7 +42,7 @@ type RouterConfig struct {
 // CORS policy: CORS is intentionally NOT applied at this internal service layer.
 // payment is reached only via the API gateway, which owns all browser-facing
 // CORS handling. (CONVENTIONS §9)
-func NewRouter(cfg RouterConfig) *gin.Engine {
+func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
@@ -65,6 +73,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// passthrough, matching the gateway's dev signing-skip.
 	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
+	// Per-authenticated-user rate limiter. Mounted AFTER VerifyGatewaySignature +
+	// RequireValidIdentity so the key is derived from the VERIFIED identity (never
+	// attacker-controlled). Only mounted when UserRateLimitPerMin > 0.
+	if cfg.UserRateLimitPerMin > 0 {
+		userRL := middleware.NewGeneralUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+		api.Use(userRL.Handler())
+	}
 
 	// Transaction creation and state transitions — tier 3 required (§3.A Tier3 金流).
 	api.POST("/transactions", middleware.RequireTier(3), txH.Create)
