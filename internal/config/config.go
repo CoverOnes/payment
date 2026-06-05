@@ -56,6 +56,15 @@ type Config struct {
 	// chmod 0600 the file that provides it; prefer the env var as canonical.
 	// Env: PAYMENT_GATEWAY_HMAC_SECRET
 	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
+
+	// SettlementS2SToken is the shared secret used by the S2S middleware on the
+	// settlement disburse endpoint (backend-security-design §5.5).
+	// Trusted internal callers (workspace service) MUST present this token in
+	// X-Service-Token. The endpoint is not yet wired to any route (PR2).
+	// Non-dev (staging/production): REQUIRED, MUST be ≥32 chars.
+	// Dev: may be empty (endpoint not wired anyway); if set must be ≥32 chars.
+	// Env: PAYMENT_SETTLEMENT_S2S_TOKEN
+	SettlementS2SToken string `mapstructure:"settlement_s2s_token"`
 }
 
 // Load reads configuration from environment variables (prefix PAYMENT_).
@@ -67,15 +76,16 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":                "PAYMENT_PORT",
-		"postgres_dsn":        "PAYMENT_POSTGRES_DSN",
-		"db_schema":           "PAYMENT_DB_SCHEMA",
-		"db_max_conns":        "PAYMENT_DB_MAX_CONNS",
-		"db_min_conns":        "PAYMENT_DB_MIN_CONNS",
-		"redis_url":           "PAYMENT_REDIS_URL",
-		"log_level":           "PAYMENT_LOG_LEVEL",
-		"env":                 "PAYMENT_ENV",
-		"gateway_hmac_secret": "PAYMENT_GATEWAY_HMAC_SECRET",
+		"port":                 "PAYMENT_PORT",
+		"postgres_dsn":         "PAYMENT_POSTGRES_DSN",
+		"db_schema":            "PAYMENT_DB_SCHEMA",
+		"db_max_conns":         "PAYMENT_DB_MAX_CONNS",
+		"db_min_conns":         "PAYMENT_DB_MIN_CONNS",
+		"redis_url":            "PAYMENT_REDIS_URL",
+		"log_level":            "PAYMENT_LOG_LEVEL",
+		"env":                  "PAYMENT_ENV",
+		"gateway_hmac_secret":  "PAYMENT_GATEWAY_HMAC_SECRET",
+		"settlement_s2s_token": "PAYMENT_SETTLEMENT_S2S_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -150,6 +160,7 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateGatewayHMAC()...)
+	errs = append(errs, c.validateSettlementS2SToken()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -190,4 +201,31 @@ func (c *Config) validateGatewayHMAC() []string {
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// minS2STokenLen is the minimum length of the settlement S2S token.
+// Matches minHMACSecretLen (32 chars) per backend-security-design §5.5.
+const minS2STokenLen = 32
+
+// validateSettlementS2SToken enforces the fail-closed secret posture for the
+// settlement S2S token (backend-security-design §5.5):
+//   - non-dev (staging/production): REQUIRED and MUST be ≥32 chars.
+//   - dev: may be empty (endpoint not yet wired in PR1); if set must be ≥32 chars.
+func (c *Config) validateSettlementS2SToken() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if len(c.SettlementS2SToken) < minS2STokenLen {
+			errs = append(errs, "PAYMENT_SETTLEMENT_S2S_TOKEN must be at least 32 characters in non-dev (staging/production) environments")
+		}
+
+		return errs
+	}
+
+	// Dev: empty is allowed; non-empty must be ≥32.
+	if c.SettlementS2SToken != "" && len(c.SettlementS2SToken) < minS2STokenLen {
+		errs = append(errs, "PAYMENT_SETTLEMENT_S2S_TOKEN, when set, must be at least 32 characters")
+	}
+
+	return errs
 }
