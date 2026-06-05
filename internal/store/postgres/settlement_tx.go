@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/CoverOnes/payment/internal/store"
 	"github.com/jackc/pgx/v5"
@@ -42,7 +43,7 @@ func (m *SettlementTxManager) WithSettlementTx(
 
 	defer func() {
 		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-			_ = rbErr
+			slog.Warn("settlement tx rollback failed", "err", rbErr)
 		}
 	}()
 
