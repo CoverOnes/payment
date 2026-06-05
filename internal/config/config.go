@@ -89,6 +89,17 @@ type Config struct {
 	// Dev: may be empty (zero UUID used as fallback).
 	// Env: PAYMENT_PLATFORM_USER_ID
 	PlatformUserID string `mapstructure:"platform_user_id"`
+
+	// UserRateLimitPerMin is the per-authenticated-user request budget per minute
+	// for the user-facing API group (/v1). 0 disables the per-user limiter (the
+	// IP-level limiter still applies). Default: 120.
+	// Env: PAYMENT_USER_RATE_LIMIT_PER_MIN
+	UserRateLimitPerMin int `mapstructure:"user_rate_limit_per_min"`
+
+	// UserRateLimitBurst is the token-bucket burst allowance for the per-user limiter.
+	// Must be > 0 when the per-user limiter is enabled (UserRateLimitPerMin > 0). Default: 20.
+	// Env: PAYMENT_USER_RATE_LIMIT_BURST
+	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
 }
 
 // Load reads configuration from environment variables (prefix PAYMENT_).
@@ -100,19 +111,21 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":                 "PAYMENT_PORT",
-		"postgres_dsn":         "PAYMENT_POSTGRES_DSN",
-		"db_schema":            "PAYMENT_DB_SCHEMA",
-		"db_max_conns":         "PAYMENT_DB_MAX_CONNS",
-		"db_min_conns":         "PAYMENT_DB_MIN_CONNS",
-		"redis_url":            "PAYMENT_REDIS_URL",
-		"log_level":            "PAYMENT_LOG_LEVEL",
-		"env":                  "PAYMENT_ENV",
-		"gateway_hmac_secret":  "PAYMENT_GATEWAY_HMAC_SECRET",
-		"settlement_s2s_token": "PAYMENT_SETTLEMENT_S2S_TOKEN",
-		"workspace_base_url":   "PAYMENT_WORKSPACE_BASE_URL",
-		"workspace_s2s_token":  "PAYMENT_WORKSPACE_S2S_TOKEN",
-		"platform_user_id":     "PAYMENT_PLATFORM_USER_ID",
+		"port":                    "PAYMENT_PORT",
+		"postgres_dsn":            "PAYMENT_POSTGRES_DSN",
+		"db_schema":               "PAYMENT_DB_SCHEMA",
+		"db_max_conns":            "PAYMENT_DB_MAX_CONNS",
+		"db_min_conns":            "PAYMENT_DB_MIN_CONNS",
+		"redis_url":               "PAYMENT_REDIS_URL",
+		"log_level":               "PAYMENT_LOG_LEVEL",
+		"env":                     "PAYMENT_ENV",
+		"gateway_hmac_secret":     "PAYMENT_GATEWAY_HMAC_SECRET",
+		"settlement_s2s_token":    "PAYMENT_SETTLEMENT_S2S_TOKEN",
+		"workspace_base_url":      "PAYMENT_WORKSPACE_BASE_URL",
+		"workspace_s2s_token":     "PAYMENT_WORKSPACE_S2S_TOKEN",
+		"platform_user_id":        "PAYMENT_PLATFORM_USER_ID",
+		"user_rate_limit_per_min": "PAYMENT_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":   "PAYMENT_USER_RATE_LIMIT_BURST",
 	}
 
 	for key, envKey := range bindings {
@@ -129,6 +142,8 @@ func Load() (*Config, error) {
 	// gateway-signature verification §24.1. Fail-closed: empty env → boot error.
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
+	v.SetDefault("user_rate_limit_per_min", 120)
+	v.SetDefault("user_rate_limit_burst", 20)
 
 	var cfg Config
 
@@ -191,6 +206,7 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateWorkspace()...)
 	errs = append(errs, c.validateRedis()...)
 	errs = append(errs, c.validatePlatformUserID()...)
+	errs = append(errs, c.validateUserRateLimit()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -337,6 +353,26 @@ func (c *Config) validatePlatformUserID() []string {
 	}
 
 	return nil
+}
+
+// validateUserRateLimit validates the per-user rate-limit configuration:
+//   - UserRateLimitPerMin must be >= 0 (0 = disabled).
+//   - UserRateLimitBurst must be > 0 when per-user limiting is enabled.
+//
+// Per-user limiter is disabled (no-op) when UserRateLimitPerMin == 0,
+// so burst is irrelevant in that case and not validated.
+func (c *Config) validateUserRateLimit() []string {
+	var errs []string
+
+	if c.UserRateLimitPerMin < 0 {
+		errs = append(errs, "PAYMENT_USER_RATE_LIMIT_PER_MIN must be >= 0 (0 = disabled)")
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst <= 0 {
+		errs = append(errs, "PAYMENT_USER_RATE_LIMIT_BURST must be > 0 when per-user limiter is enabled (PAYMENT_USER_RATE_LIMIT_PER_MIN > 0)")
+	}
+
+	return errs
 }
 
 // PlatformUserUUID returns the platform user ID as a uuid.UUID.

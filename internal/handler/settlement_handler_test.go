@@ -30,7 +30,7 @@ const (
 // buildTestRouter returns a test Gin engine wired with a nil-store-backed SettlementService
 // for auth-gating tests (no DB calls reach the DB).
 func buildTestRouter() http.Handler {
-	return handler.NewRouter(handler.RouterConfig{
+	return handler.NewRouter(&handler.RouterConfig{
 		TransactionSvc:     nil,
 		SettlementSvc:      &service.SettlementService{},
 		Pool:               nil,
