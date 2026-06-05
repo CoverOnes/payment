@@ -240,6 +240,26 @@ type DisburseMilestoneInput struct {
 	ActorService string
 }
 
+// VendorDisburseOutcome records the per-vendor result of a single DisburseMilestone call.
+// Callers use this to build an honest API response reflecting partial-failure scenarios.
+type VendorDisburseOutcome struct {
+	// VendorUserID identifies the vendor.
+	VendorUserID uuid.UUID `json:"vendorUserId"`
+	// Status is "DISBURSED" or "FAILED".
+	Status string `json:"status"`
+}
+
+// DisburseResult is the structured outcome of DisburseMilestone.
+// It replaces the opaque bool-anyFailed that was previously internal-only.
+type DisburseResult struct {
+	// Outcomes is one entry per vendor allocation, in allocation order.
+	Outcomes []VendorDisburseOutcome
+	// DisbursedCount is the number of vendors successfully disbursed (or idempotently skipped).
+	DisbursedCount int
+	// FailedCount is the number of vendors whose disbursement failed this call.
+	FailedCount int
+}
+
 // DisburseMilestone disburses a milestone payout to all frozen allocations of a plan.
 //
 // Algorithm (per-milestone model — fixes multi-milestone bug):
@@ -252,14 +272,17 @@ type DisburseMilestoneInput struct {
 //     in the SAME transaction (atomicity — Critical fix).
 //  6. Partial-failure: a failed vendor gets status FAILED; others still disburse.
 //  7. Triple sum-check pre-tx and post-tx.
-func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseMilestoneInput) error {
+//
+// Returns a *DisburseResult describing the per-vendor outcome so the caller can
+// render an honest HTTP response discriminant (200/207/502 + status field).
+func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseMilestoneInput) (*DisburseResult, error) {
 	if err := validateDisburseMilestoneInput(in); err != nil {
-		return err
+		return nil, err
 	}
 
 	var disbursedAmounts []decimal.Decimal
 
-	var anyFailed bool
+	var outcomes []VendorDisburseOutcome
 
 	txErr := s.txMgr.WithSettlementTx(ctx, func(
 		ctx context.Context,
@@ -269,14 +292,20 @@ func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseM
 		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
 	) error {
-		return s.disburseMilestoneTx(ctx, in, plans, allocs, disbursements, txTxStore, audit, &disbursedAmounts, &anyFailed)
+		return s.disburseMilestoneTx(ctx, in, plans, allocs, disbursements, txTxStore, audit, &disbursedAmounts, &outcomes)
 	})
 
 	if txErr != nil {
-		return txErr
+		return nil, txErr
 	}
 
-	return s.postDisburseCheck(in, disbursedAmounts, anyFailed)
+	result := buildDisburseResult(outcomes)
+
+	if err := s.postDisburseCheck(in, disbursedAmounts, result.FailedCount > 0); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // disburseMilestoneTx runs the disburse logic inside a DB transaction.
@@ -290,7 +319,7 @@ func (s *SettlementService) disburseMilestoneTx(
 	txTxStore store.TransactionStore,
 	audit store.SettlementAuditStore,
 	disbursedAmounts *[]decimal.Decimal,
-	anyFailed *bool,
+	outcomes *[]VendorDisburseOutcome,
 ) error {
 	plan, lockErr := plans.GetByIDForUpdate(ctx, in.PlanID)
 	if lockErr != nil {
@@ -322,17 +351,40 @@ func (s *SettlementService) disburseMilestoneTx(
 	}
 
 	*disbursedAmounts = make([]decimal.Decimal, 0, len(lockedAllocs))
+	*outcomes = make([]VendorDisburseOutcome, 0, len(lockedAllocs))
 
 	for i, alloc := range lockedAllocs {
 		ok, disbursed := s.disburseAllocation(ctx, in, disbursements, txTxStore, audit, plan, alloc, amounts[i])
 		if ok {
 			*disbursedAmounts = append(*disbursedAmounts, disbursed)
+			*outcomes = append(*outcomes, VendorDisburseOutcome{
+				VendorUserID: alloc.VendorUserID,
+				Status:       string(domain.MilestoneDisbursementStatusDisbursed),
+			})
 		} else {
-			*anyFailed = true
+			*outcomes = append(*outcomes, VendorDisburseOutcome{
+				VendorUserID: alloc.VendorUserID,
+				Status:       string(domain.MilestoneDisbursementStatusFailed),
+			})
 		}
 	}
 
 	return nil
+}
+
+// buildDisburseResult aggregates per-vendor outcomes into a DisburseResult summary.
+func buildDisburseResult(outcomes []VendorDisburseOutcome) *DisburseResult {
+	r := &DisburseResult{Outcomes: outcomes}
+
+	for _, o := range outcomes {
+		if o.Status == string(domain.MilestoneDisbursementStatusDisbursed) {
+			r.DisbursedCount++
+		} else {
+			r.FailedCount++
+		}
+	}
+
+	return r
 }
 
 // disburseAllocation disburses a single allocation using the per-milestone disbursement model.
