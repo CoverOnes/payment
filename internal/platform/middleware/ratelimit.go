@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -144,10 +145,10 @@ func (rl *RateLimiter) increment(ctx context.Context, key string) (int, error) {
 	return int(incr.Val()), nil
 }
 
-// userFallbackLRUCap is the maximum number of unique user IDs tracked by the
+// userLRUCap is the maximum number of unique user IDs tracked by the
 // in-process per-user limiter. Bounding by LRU prevents memory exhaustion under
 // high account-rotation attacks.
-const userFallbackLRUCap = 100_000
+const userLRUCap = 100_000
 
 // UserRateLimiter is a per-authenticated-user in-process token-bucket rate limiter.
 // Key is derived from the verified user_id set in gin context by RequireValidIdentity.
@@ -173,7 +174,7 @@ type UserRateLimiter struct {
 func NewGeneralUserRateLimiter(limitPerMin, burst int) *UserRateLimiter {
 	r := rate.Limit(float64(limitPerMin) / 60.0)
 
-	cache, err := lru.New[string, *rate.Limiter](userFallbackLRUCap)
+	cache, err := lru.New[string, *rate.Limiter](userLRUCap)
 	if err != nil {
 		// lru.New only errors when cap <= 0, which cannot happen here.
 		panic(fmt.Sprintf("UserRateLimiter: unexpected lru.New error: %v", err))
@@ -209,7 +210,11 @@ func (l *UserRateLimiter) allow(key string) bool {
 //
 // On deny: sets Retry-After header and returns 429 RATE_LIMITED.
 func (l *UserRateLimiter) Handler() gin.HandlerFunc {
-	retryAfter := strconv.Itoa(int(60.0 / float64(l.limitPerMin)))
+	// Compute the earliest time (in whole seconds) after which a client should
+	// retry. math.Ceil ensures the value is always ≥ 1 s even when limitPerMin
+	// > 60 (e.g. the default of 120 rps would yield 0 with plain integer
+	// division, telling clients to retry immediately — which is wrong).
+	retryAfter := strconv.Itoa(max(1, int(math.Ceil(60.0/float64(l.limitPerMin)))))
 
 	return func(c *gin.Context) {
 		identity, ok := IdentityFromCtx(c)

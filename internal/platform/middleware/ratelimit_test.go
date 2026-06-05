@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -84,30 +85,55 @@ func TestUserRateLimiter(t *testing.T) {
 	})
 
 	t.Run("over_budget_sets_retry_after_header", func(t *testing.T) {
-		// burst=1: 2nd request must carry Retry-After.
-		gin.SetMode(gin.TestMode)
+		// Table-driven: verify Retry-After is always >= "1" (never "0").
+		// Previously, limitPerMin > 60 (e.g. 120) caused integer truncation → "0".
+		tests := []struct {
+			name        string
+			limitPerMin int
+			wantAtLeast int // Retry-After must be >= this value
+		}{
+			// limitPerMin=60 → ceil(60/60)=1 → "1"
+			{"perMin_60", 60, 1},
+			// limitPerMin=120 → ceil(60/120)=ceil(0.5)=1 → "1" (regression: was "0")
+			{"perMin_120", 120, 1},
+			// limitPerMin=30 → ceil(60/30)=2 → "2"
+			{"perMin_30", 30, 2},
+		}
 
-		r := gin.New()
-		r.Use(func(c *gin.Context) {
-			uid, _ := uuid.Parse(userA)
-			c.Set(ctxKeyUserID, uid)
-			c.Set(ctxKeyKYCTier, 0)
-			c.Set(ctxKeyAccountType, "")
-			c.Next()
-		})
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				gin.SetMode(gin.TestMode)
 
-		userRL := NewGeneralUserRateLimiter(60, 1)
-		r.Use(userRL.Handler())
-		r.GET("/v1/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+				r := gin.New()
+				r.Use(func(c *gin.Context) {
+					uid, _ := uuid.Parse(userA)
+					c.Set(ctxKeyUserID, uid)
+					c.Set(ctxKeyKYCTier, 0)
+					c.Set(ctxKeyAccountType, "")
+					c.Next()
+				})
 
-		doGet(t, r) // consume burst
+				userRL := NewGeneralUserRateLimiter(tc.limitPerMin, 1)
+				r.Use(userRL.Handler())
+				r.GET("/v1/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/ping", http.NoBody)
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
+				doGet(t, r) // consume burst
 
-		assert.Equal(t, http.StatusTooManyRequests, rec.Code)
-		assert.NotEmpty(t, rec.Header().Get("Retry-After"), "Retry-After header must be set on 429")
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/ping", http.NoBody)
+				rec := httptest.NewRecorder()
+				r.ServeHTTP(rec, req)
+
+				assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+				ra := rec.Header().Get("Retry-After")
+				assert.NotEmpty(t, ra, "Retry-After header must be set on 429")
+
+				raVal, err := strconv.Atoi(ra)
+				assert.NoError(t, err, "Retry-After must be a valid integer, got %q", ra)
+				assert.GreaterOrEqual(t, raVal, tc.wantAtLeast,
+					"Retry-After=%q must be >= %d for limitPerMin=%d", ra, tc.wantAtLeast, tc.limitPerMin)
+			})
+		}
 	})
 
 	t.Run("two_users_have_independent_buckets", func(t *testing.T) {
