@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/CoverOnes/payment/internal/service"
@@ -67,6 +68,11 @@ func NewSettlementConsumer(rdb *redis.Client, svc *service.SettlementService) *S
 // Start subscribes to workspace channels and processes events until ctx is canceled.
 // MUST be called in a goroutine. Uses context.Background()-derived sub-contexts for
 // per-event calls so individual event processing outlives the caller's goroutine lifecycle.
+//
+// Graceful drain: each incoming message is dispatched in its own goroutine tracked by a
+// sync.WaitGroup. When ctx is canceled the loop stops accepting new messages and
+// waits for all in-flight handlers to finish before returning, so that a SIGTERM
+// cannot cut off a disbursement mid-flight (leaving a PENDING row).
 func (c *SettlementConsumer) Start(ctx context.Context) {
 	pubsub := c.rdb.Subscribe(ctx, channelContractActivated, channelContractCompleted)
 
@@ -81,19 +87,31 @@ func (c *SettlementConsumer) Start(ctx context.Context) {
 
 	ch := pubsub.Channel()
 
+	var wg sync.WaitGroup
+
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("settlement event consumer stopping (context canceled)")
+			slog.Info("settlement event consumer stopping (context canceled); draining in-flight handlers")
+			wg.Wait()
+			slog.Info("settlement event consumer: all in-flight handlers finished")
+
 			return
 
 		case msg, ok := <-ch:
 			if !ok {
-				slog.Warn("settlement consumer channel closed; stopping")
+				slog.Warn("settlement consumer channel closed; stopping; draining in-flight handlers")
+				wg.Wait()
+
 				return
 			}
 
-			c.dispatch(ctx, msg)
+			wg.Add(1)
+
+			go func(m *redis.Message) {
+				defer wg.Done()
+				c.dispatch(ctx, m)
+			}(msg)
 		}
 	}
 }
@@ -204,7 +222,7 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 		currency = "TWD"
 	}
 
-	err = c.svc.DisburseMilestone(callCtx, &service.DisburseMilestoneInput{
+	result, err := c.svc.DisburseMilestone(callCtx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  evt.Data.MilestoneID,
 		Amount:       evt.Data.Amount,
@@ -217,6 +235,17 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 			"plan_id", plan.ID,
 			"milestone_id", evt.Data.MilestoneID,
 			"err", err)
+
+		return
+	}
+
+	if result.FailedCount > 0 {
+		slog.Warn("settlement consumer: milestone disburse partial failure; plan re-triggerable",
+			"event_id", evt.EventID,
+			"plan_id", plan.ID,
+			"milestone_id", evt.Data.MilestoneID,
+			"disbursed", result.DisbursedCount,
+			"failed", result.FailedCount)
 
 		return
 	}

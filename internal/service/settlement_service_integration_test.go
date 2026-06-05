@@ -311,7 +311,7 @@ func TestSettlementService_DisburseMilestone_Happy3Party(t *testing.T) {
 	milestoneID := uuid.New()
 	amount, _ := decimal.NewFromString("3000.00")
 
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -388,7 +388,7 @@ func TestSettlementService_DisburseMilestone_RoundingAbsorb(t *testing.T) {
 	amount, _ := decimal.NewFromString("100.01")
 	milestoneID := uuid.New()
 
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -449,7 +449,7 @@ func TestSettlementService_DisburseMilestone_Idempotent(t *testing.T) {
 	amount, _ := decimal.NewFromString("1000.00")
 
 	// First disburse.
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -459,7 +459,7 @@ func TestSettlementService_DisburseMilestone_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Second disburse — same (plan, milestone) → UNIQUE conflict on disbursement record → idempotent skip.
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -520,7 +520,7 @@ func TestSettlementService_DisburseMilestone_TOCTOU(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			errs[idx] = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+			_, errs[idx] = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 				PlanID:       plan.ID,
 				MilestoneID:  milestoneID,
 				Amount:       amount,
@@ -586,7 +586,7 @@ func TestSettlementService_DisburseMilestone_HappyFullDisburse(t *testing.T) {
 	milestoneID := uuid.New()
 	amount, _ := decimal.NewFromString("9000.00")
 
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -751,15 +751,18 @@ func TestSettlementService_DisburseMilestone_PartialFailure_WithDI(t *testing.T)
 	amount, _ := decimal.NewFromString("9000.00")
 
 	// Disburse: vendor1 DISBURSED, vendor2 FAILED (injected failure), vendor3 DISBURSED.
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	diResult, err := svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
 		Currency:     "TWD",
 		ActorService: "test-partial-di",
 	})
-	// Service returns nil (partial failure = plan stays ACTIVE, anyFailed=true is logged but not returned).
+	// Service returns nil error (partial failure = plan stays ACTIVE; result carries outcome detail).
 	require.NoError(t, err, "partial failure is not a fatal error; plan stays re-triggerable")
+	require.NotNil(t, diResult)
+	assert.Equal(t, 2, diResult.DisbursedCount, "vendor1 and vendor3 must be disbursed")
+	assert.Equal(t, 1, diResult.FailedCount, "vendor2 must be failed (injection)")
 
 	// Verify disbursement records.
 	disbursements, err := svc.GetMilestoneDisbursements(ctx, plan.ID, milestoneID)
@@ -851,7 +854,7 @@ func TestSettlementService_DisburseMilestone_FailedVendorRetriable(t *testing.T)
 	amount, _ := decimal.NewFromString("9000.00")
 
 	// First call: vendor2 tx Create is injected to fail → vendor2 FAILED.
-	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -893,7 +896,7 @@ func TestSettlementService_DisburseMilestone_FailedVendorRetriable(t *testing.T)
 		testPlatformUID,
 	)
 
-	err = svcRetry.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svcRetry.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestoneID,
 		Amount:       amount,
@@ -1062,7 +1065,7 @@ func TestSettlementService_DisburseMilestone_InvalidInputs(t *testing.T) {
 
 	for _, tc := range table {
 		t.Run(tc.name, func(t *testing.T) {
-			err := svc.DisburseMilestone(ctx, tc.input)
+			_, err := svc.DisburseMilestone(ctx, tc.input)
 			require.Error(t, err)
 			require.True(t, errors.Is(err, tc.want),
 				"expected %v got %v", tc.want, err)
@@ -1181,13 +1184,14 @@ func TestSettlementService_DisburseMilestone_MultipleMilestones(t *testing.T) {
 	milestone2 := uuid.New()
 
 	// ── Disburse milestone 1 ──────────────────────────────────────────────────
-	require.NoError(t, svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestone1,
 		Amount:       amount1,
 		Currency:     "TWD",
 		ActorService: "test",
-	}))
+	})
+	require.NoError(t, err)
 
 	// Assert milestone-1 disbursement records.
 	d1, err := svc.GetMilestoneDisbursements(ctx, plan.ID, milestone1)
@@ -1213,13 +1217,14 @@ func TestSettlementService_DisburseMilestone_MultipleMilestones(t *testing.T) {
 	// would find them DISBURSED and silently pay nothing.
 	// In the NEW model, milestone-2 uses a different (plan,milestone,vendor) key
 	// and creates INDEPENDENT disbursement records.
-	require.NoError(t, svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  milestone2,
 		Amount:       amount2,
 		Currency:     "TWD",
 		ActorService: "test",
-	}), "milestone-2 disburse MUST NOT be blocked by milestone-1 (per-milestone model regression)")
+	})
+	require.NoError(t, err, "milestone-2 disburse MUST NOT be blocked by milestone-1 (per-milestone model regression)")
 
 	// Assert milestone-2 disbursement records — NEW records must exist.
 	d2, err := svc.GetMilestoneDisbursements(ctx, plan.ID, milestone2)
