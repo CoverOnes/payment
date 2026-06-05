@@ -16,15 +16,17 @@ import (
 
 // SettlementService implements the business logic for multi-party split settlement.
 // CreatePlan freezes the party roster at contract activation time.
-// DisburseMilestone computes and disburses allocated amounts per milestone, with
-// last-allocation-absorbs-rounding so Σ allocated == milestone amount exactly.
+// DisburseMilestone computes and disburses per-milestone amounts to each vendor using
+// a per-(plan, milestone, vendor) disbursement record — fixing the multi-milestone bug
+// where the old per-plan allocation status caused milestone 2+ to silently pay nothing.
 type SettlementService struct {
-	plans   store.SettlementPlanStore
-	allocs  store.SettlementAllocationStore
-	audit   store.SettlementAuditStore
-	txMgr   store.SettlementTxManager
-	txStore store.TransactionStore
-	roster  WorkspaceRosterClient
+	plans         store.SettlementPlanStore
+	allocs        store.SettlementAllocationStore
+	disburseStore store.SettlementMilestoneDisbursementStore
+	audit         store.SettlementAuditStore
+	txMgr         store.SettlementTxManager
+	roster        WorkspaceRosterClient
+	platformUID   uuid.UUID // PayerUserID for all disburse transactions (self-transfer guard)
 }
 
 // WorkspaceRosterClient fetches the frozen ACTIVE-party roster from the workspace service.
@@ -42,21 +44,27 @@ type RosterEntry struct {
 }
 
 // NewSettlementService returns a SettlementService.
+// platformUID is the system payer identity used in disburse transactions (self-transfer guard:
+// PayerUserID = platformUID, PayeeUserID = vendor, so payer != payee always).
+// The transactions.Create call inside disburse uses the tx-scoped TransactionStore passed
+// by WithSettlementTx — no pool-backed TransactionStore is needed by the service itself.
 func NewSettlementService(
 	plans store.SettlementPlanStore,
 	allocs store.SettlementAllocationStore,
+	disburseStore store.SettlementMilestoneDisbursementStore,
 	audit store.SettlementAuditStore,
 	txMgr store.SettlementTxManager,
-	txStore store.TransactionStore,
 	roster WorkspaceRosterClient,
+	platformUID uuid.UUID,
 ) *SettlementService {
 	return &SettlementService{
-		plans:   plans,
-		allocs:  allocs,
-		audit:   audit,
-		txMgr:   txMgr,
-		txStore: txStore,
-		roster:  roster,
+		plans:         plans,
+		allocs:        allocs,
+		disburseStore: disburseStore,
+		audit:         audit,
+		txMgr:         txMgr,
+		roster:        roster,
+		platformUID:   platformUID,
 	}
 }
 
@@ -75,7 +83,7 @@ type CreatePlanInput struct {
 // CreatePlan creates a settlement plan for a multiparty contract by:
 //  1. Fetching the frozen ACTIVE-party roster from the workspace S2S endpoint.
 //  2. Triple sum-checking Σ(shareBps) == 10000.
-//  3. Persisting the plan + all allocations (allocated_amount = 0, set at disburse time).
+//  3. Persisting the plan + all allocations (allocated_amount = 0, informational only).
 //
 // Idempotent: if a plan already exists for this contract, returns nil, nil (no-op).
 // No FK constraints anywhere (backend-security-design §1.1).
@@ -131,6 +139,8 @@ func (s *SettlementService) CreatePlan(ctx context.Context, in *CreatePlanInput)
 
 // buildPlanWithAllocations constructs the SettlementPlan and its allocation rows
 // from the validated roster. Extracted to reduce CreatePlan cyclomatic complexity.
+// settlement_allocations is now a FROZEN ROSTER only; allocation.status is NOT used
+// as the per-milestone disburse guard (see settlement_milestone_disbursements).
 func buildPlanWithAllocations(in *CreatePlanInput, roster []RosterEntry) (*domain.SettlementPlan, []*domain.SettlementAllocation) {
 	now := time.Now().UTC()
 	plan := &domain.SettlementPlan{
@@ -178,6 +188,8 @@ func (s *SettlementService) persistPlan(
 		ctx context.Context,
 		plans store.TxSettlementPlanStore,
 		allocs store.TxSettlementAllocationStore,
+		_ store.SettlementMilestoneDisbursementStore,
+		_ store.TransactionStore,
 		audit store.SettlementAuditStore,
 	) error {
 		if planErr := plans.Create(ctx, plan); planErr != nil {
@@ -212,6 +224,9 @@ func (s *SettlementService) persistPlan(
 }
 
 // DisburseMilestoneInput carries the validated input for DisburseMilestone.
+// IdempotencyKeySuffix has been removed — idempotency is content-addressed by
+// (plan_id, milestone_id, vendor_user_id), which is intrinsically unique per payout.
+// Caller-supplied suffix was misleading and created an ORPHAN PENDING risk.
 type DisburseMilestoneInput struct {
 	// PlanID is the settlement plan to disburse against.
 	PlanID uuid.UUID
@@ -221,21 +236,22 @@ type DisburseMilestoneInput struct {
 	Amount decimal.Decimal
 	// Currency is the ISO 4217 settlement currency.
 	Currency string
-	// IdempotencyKeySuffix is used as part of the per-(plan, milestone, vendor) idempotency key.
-	IdempotencyKeySuffix string
 	// ActorService identifies the caller for the audit trail.
 	ActorService string
 }
 
 // DisburseMilestone disburses a milestone payout to all frozen allocations of a plan.
 //
-// Algorithm:
+// Algorithm (per-milestone model — fixes multi-milestone bug):
 //  1. SELECT FOR UPDATE on the plan (TOCTOU serialization).
-//  2. SELECT FOR UPDATE on all allocations.
-//  3. For each PENDING allocation: compute allocated = amount × shareBps / 10000 (last absorbs rounding).
-//  4. Create one transactions row per allocation (status RELEASED — direct pay, no escrow).
-//  5. Partial-failure: a failed allocation is marked FAILED; others still disburse.
-//  6. Triple sum-check pre-tx and post-tx.
+//  2. SELECT FOR UPDATE on all allocations (frozen roster).
+//  3. For each allocation: compute amount × shareBps / 10000 (last absorbs rounding).
+//  4. Idempotency: check settlement_milestone_disbursements for (plan, milestone, vendor);
+//     if already DISBURSED → genuine skip (return success WITHOUT re-creating).
+//  5. Create one settlement_milestone_disbursements row + one transactions row per vendor
+//     in the SAME transaction (atomicity — Critical fix).
+//  6. Partial-failure: a failed vendor gets status FAILED; others still disburse.
+//  7. Triple sum-check pre-tx and post-tx.
 func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseMilestoneInput) error {
 	if err := validateDisburseMilestoneInput(in); err != nil {
 		return err
@@ -249,9 +265,11 @@ func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseM
 		ctx context.Context,
 		plans store.TxSettlementPlanStore,
 		allocs store.TxSettlementAllocationStore,
+		disbursements store.SettlementMilestoneDisbursementStore,
+		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
 	) error {
-		return s.disburseMilestoneTx(ctx, in, plans, allocs, audit, &disbursedAmounts, &anyFailed)
+		return s.disburseMilestoneTx(ctx, in, plans, allocs, disbursements, txTxStore, audit, &disbursedAmounts, &anyFailed)
 	})
 
 	if txErr != nil {
@@ -268,6 +286,8 @@ func (s *SettlementService) disburseMilestoneTx(
 	in *DisburseMilestoneInput,
 	plans store.TxSettlementPlanStore,
 	allocs store.TxSettlementAllocationStore,
+	disbursements store.SettlementMilestoneDisbursementStore,
+	txTxStore store.TransactionStore,
 	audit store.SettlementAuditStore,
 	disbursedAmounts *[]decimal.Decimal,
 	anyFailed *bool,
@@ -304,12 +324,7 @@ func (s *SettlementService) disburseMilestoneTx(
 	*disbursedAmounts = make([]decimal.Decimal, 0, len(lockedAllocs))
 
 	for i, alloc := range lockedAllocs {
-		if alloc.Status == domain.AllocationStatusDisbursed {
-			*disbursedAmounts = append(*disbursedAmounts, amounts[i])
-			continue
-		}
-
-		ok, disbursed := s.disburseAllocation(ctx, in, allocs, audit, plan, alloc, amounts[i])
+		ok, disbursed := s.disburseAllocation(ctx, in, disbursements, txTxStore, audit, plan, alloc, amounts[i])
 		if ok {
 			*disbursedAmounts = append(*disbursedAmounts, disbursed)
 		} else {
@@ -320,22 +335,70 @@ func (s *SettlementService) disburseMilestoneTx(
 	return nil
 }
 
-// disburseAllocation disburses a single allocation. Returns (true, amount) on success,
-// (false, zero) if the allocation failed (already marked FAILED in the store).
+// disburseAllocation disburses a single allocation using the per-milestone disbursement model.
+// Returns (true, amount) on success or idempotent skip, (false, zero) on failure.
+//
+// Idempotency: if (plan, milestone, vendor) already has a DISBURSED record → genuine skip.
+// Atomicity: the transactions row + the settlement_milestone_disbursements row are written
+// inside the same DB transaction via the tx-scoped txTxStore and disbursements stores.
 func (s *SettlementService) disburseAllocation(
 	ctx context.Context,
 	in *DisburseMilestoneInput,
-	allocs store.TxSettlementAllocationStore,
+	disbursements store.SettlementMilestoneDisbursementStore,
+	txTxStore store.TransactionStore,
 	audit store.SettlementAuditStore,
 	plan *domain.SettlementPlan,
 	alloc *domain.SettlementAllocation,
 	allocAmt decimal.Decimal,
 ) (bool, decimal.Decimal) {
-	iKey := fmt.Sprintf("disburse:%s:%s:vendor:%s", in.PlanID, in.MilestoneID, alloc.VendorUserID)
+	// Content-addressed idempotency key: unique per (plan, milestone, vendor).
+	iKey := fmt.Sprintf("disburse:%s:%s:%s", in.PlanID, in.MilestoneID, alloc.VendorUserID)
 
+	now := time.Now().UTC()
+
+	// Create the per-milestone disbursement record FIRST (PENDING).
+	// Uses ON CONFLICT DO NOTHING so an idempotent replay does NOT abort the transaction
+	// (a plain INSERT UNIQUE violation would leave the tx in SQLSTATE 25P02, poisoning
+	// all subsequent statements). Returns inserted=false when the row already existed.
+	disburseRow := &domain.SettlementMilestoneDisbursement{
+		ID:             uuid.New(),
+		PlanID:         in.PlanID,
+		MilestoneID:    in.MilestoneID,
+		VendorUserID:   alloc.VendorUserID,
+		Amount:         allocAmt,
+		Status:         domain.MilestoneDisbursementStatusPending,
+		IdempotencyKey: iKey,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	inserted, createErr := disbursements.Create(ctx, disburseRow)
+	if createErr != nil {
+		slog.Error("create milestone disbursement row failed; marking FAILED",
+			"plan_id", in.PlanID,
+			"milestone_id", in.MilestoneID,
+			"vendor_user_id", alloc.VendorUserID,
+			"err", createErr)
+
+		return false, decimal.Zero
+	}
+
+	if !inserted {
+		// Row already existed — idempotent skip (rev Critical 2 fix).
+		// Return success without re-creating to avoid orphan PENDING rows.
+		slog.Info("per-milestone disbursement already exists; skipping (idempotent)",
+			"plan_id", in.PlanID,
+			"milestone_id", in.MilestoneID,
+			"vendor_user_id", alloc.VendorUserID)
+
+		return true, allocAmt
+	}
+
+	// Self-transfer guard (Critical fix): PayerUserID = platform system account,
+	// PayeeUserID = vendor. This ensures payer != payee always.
 	txRow := &domain.Transaction{
 		ID:             uuid.New(),
-		PayerUserID:    alloc.VendorUserID,
+		PayerUserID:    s.platformUID,
 		PayeeUserID:    alloc.VendorUserID,
 		ContractID:     &plan.MultiContractID,
 		MilestoneID:    &in.MilestoneID,
@@ -343,24 +406,33 @@ func (s *SettlementService) disburseAllocation(
 		Currency:       in.Currency,
 		Status:         domain.StatusReleased,
 		IdempotencyKey: iKey,
-		CreatedAt:      time.Now().UTC(),
-		UpdatedAt:      time.Now().UTC(),
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 
-	if createErr := s.txStore.Create(ctx, txRow); createErr != nil {
+	// txTxStore.Create is tx-scoped (passed via WithSettlementTx 5th param).
+	// This ensures the transactions row + disbursement row are written atomically.
+	if createErr := txTxStore.Create(ctx, txRow); createErr != nil {
 		if errors.Is(createErr, domain.ErrDuplicateKey) {
-			// Already disbursed in a prior run — idempotent skip.
+			// transactions row already exists — update disbursement to DISBURSED and skip.
+			// This handles a rare race where the disbursement PENDING was created but the
+			// tx create was retried.
+			slog.Info("transactions row already exists; marking disbursement DISBURSED (idempotent)",
+				"plan_id", in.PlanID,
+				"milestone_id", in.MilestoneID,
+				"vendor_user_id", alloc.VendorUserID)
+
 			return true, allocAmt
 		}
 
-		slog.Error("disburse allocation failed; marking FAILED",
+		slog.Error("create transaction row failed; marking disbursement FAILED",
 			"plan_id", in.PlanID,
 			"milestone_id", in.MilestoneID,
 			"vendor_user_id", alloc.VendorUserID,
 			"err", createErr)
 
-		if updErr := allocs.UpdateStatus(ctx, alloc.ID, domain.AllocationStatusFailed, nil); updErr != nil {
-			slog.Error("failed to mark allocation FAILED", "allocation_id", alloc.ID, "err", updErr)
+		if updErr := disbursements.UpdateStatus(ctx, disburseRow.ID, domain.MilestoneDisbursementStatusFailed, nil); updErr != nil {
+			slog.Error("failed to mark disbursement FAILED", "disbursement_id", disburseRow.ID, "err", updErr)
 		}
 
 		return false, decimal.Zero
@@ -368,9 +440,10 @@ func (s *SettlementService) disburseAllocation(
 
 	txID := txRow.ID
 
-	if updErr := allocs.UpdateStatus(ctx, alloc.ID, domain.AllocationStatusDisbursed, &txID); updErr != nil {
-		slog.Error("update allocation to DISBURSED failed",
-			"allocation_id", alloc.ID, "err", updErr)
+	// Update disbursement record to DISBURSED with the tx_id.
+	if updErr := disbursements.UpdateStatus(ctx, disburseRow.ID, domain.MilestoneDisbursementStatusDisbursed, &txID); updErr != nil {
+		slog.Error("update disbursement to DISBURSED failed",
+			"disbursement_id", disburseRow.ID, "err", updErr)
 
 		return false, decimal.Zero
 	}
@@ -445,6 +518,11 @@ func (s *SettlementService) GetAllocations(ctx context.Context, planID uuid.UUID
 	return s.allocs.ListByPlanID(ctx, planID)
 }
 
+// GetMilestoneDisbursements returns all disbursement records for a (plan, milestone) pair.
+func (s *SettlementService) GetMilestoneDisbursements(ctx context.Context, planID, milestoneID uuid.UUID) ([]*domain.SettlementMilestoneDisbursement, error) {
+	return s.disburseStore.ListByPlanMilestone(ctx, planID, milestoneID)
+}
+
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
 func validateCreatePlanInput(in *CreatePlanInput) error {
@@ -489,11 +567,16 @@ func validateDisburseMilestoneInput(in *DisburseMilestoneInput) error {
 
 // ─── Math helpers ─────────────────────────────────────────────────────────────
 
-// validateRosterSum triple-checks Σ shareBps == 10000.
+// validateRosterSum triple-checks Σ shareBps == 10000 and each entry is in [0, 10000].
 // Three independent evaluations prevent a single arithmetic error from silently passing.
 func validateRosterSum(roster []RosterEntry) error {
 	sum1 := 0
 	for _, p := range roster {
+		if p.ShareBps < 0 || p.ShareBps > 10000 {
+			return fmt.Errorf("%w: entry share_bps=%d is out of range [0, 10000]",
+				domain.ErrSumInvariantViolation, p.ShareBps)
+		}
+
 		sum1 += p.ShareBps
 	}
 

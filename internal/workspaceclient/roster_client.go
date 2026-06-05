@@ -31,6 +31,11 @@ const (
 
 	// rosterRequestTimeout is the per-call deadline for the workspace S2S request.
 	rosterRequestTimeout = 10 * time.Second
+
+	// maxRosterEntries caps the number of roster entries after decode.
+	// Prevents a malicious or misconfigured workspace from sending an unbounded list
+	// that blows up the allocation loop in the service layer.
+	maxRosterEntries = 200
 )
 
 // HTTPRosterClient fetches the frozen ACTIVE-party roster from the workspace service
@@ -87,6 +92,11 @@ func (c *HTTPRosterClient) GetPartyRoster(ctx context.Context, contractID uuid.U
 	var body rosterResponseBody
 	if decErr := json.NewDecoder(limited).Decode(&body); decErr != nil {
 		return nil, fmt.Errorf("decode workspace roster response: %w", decErr)
+	}
+
+	if len(body.Data) > maxRosterEntries {
+		return nil, fmt.Errorf("workspace roster response exceeds maximum of %d entries (got %d) for contract %s",
+			maxRosterEntries, len(body.Data), contractID)
 	}
 
 	entries := make([]service.RosterEntry, len(body.Data))

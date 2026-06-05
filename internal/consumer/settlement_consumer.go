@@ -113,7 +113,11 @@ func (c *SettlementConsumer) dispatch(ctx context.Context, msg *redis.Message) {
 }
 
 // handleContractActivated processes workspace.contract_activated.
-// Ignores non-multiparty contracts (partyCount == 0).
+// Always attempts plan creation and lets the workspace roster S2S response determine
+// whether the contract is multiparty (≥1 party in the roster). We do NOT use
+// partyCount from the event for the multiparty decision because the event field is
+// caller-supplied and could be forged or stale; the workspace roster is authoritative.
+// If the roster is empty, CreatePlan returns ErrValidation and nothing is persisted.
 // Idempotency key: "contract_activated:<eventId>".
 //
 //nolint:contextcheck // intentional: detached context with timeout; event processing must not inherit loop ctx
@@ -121,14 +125,6 @@ func (c *SettlementConsumer) handleContractActivated(_ context.Context, payload 
 	var evt contractActivatedEvent
 	if err := json.Unmarshal([]byte(payload), &evt); err != nil {
 		slog.Error("settlement consumer: decode contract_activated failed", "err", err)
-		return
-	}
-
-	// Ignore single-party / dual-sign contracts — only multiparty (partyCount > 0).
-	if evt.Data.PartyCount == 0 {
-		slog.Debug("settlement consumer: skipping non-multiparty contract_activated",
-			"contract_id", evt.Data.ContractID)
-
 		return
 	}
 
@@ -209,12 +205,11 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 	}
 
 	err = c.svc.DisburseMilestone(callCtx, &service.DisburseMilestoneInput{
-		PlanID:               plan.ID,
-		MilestoneID:          evt.Data.MilestoneID,
-		Amount:               evt.Data.Amount,
-		Currency:             currency,
-		IdempotencyKeySuffix: evt.EventID.String(),
-		ActorService:         "payment-consumer",
+		PlanID:       plan.ID,
+		MilestoneID:  evt.Data.MilestoneID,
+		Amount:       evt.Data.Amount,
+		Currency:     currency,
+		ActorService: "payment-consumer",
 	})
 	if err != nil {
 		slog.Error("settlement consumer: DisburseMilestone failed",

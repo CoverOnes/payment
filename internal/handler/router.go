@@ -84,7 +84,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	if cfg.SettlementSvc != nil {
 		settlementH := NewSettlementHandler(cfg.SettlementSvc)
 		settlement := api.Group("/settlement")
-		settlement.POST("/plans/:id/disburse",
+		settlement.POST(
+			"/plans/:id/disburse",
 			middleware.RequireTier(3),
 			middleware.RequireServiceIdentity(cfg.SettlementS2SToken),
 			settlementH.Disburse,

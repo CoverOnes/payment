@@ -22,6 +22,12 @@ const testS2SToken = "abcdef0123456789abcdef0123456789"
 // testWorkspaceToken is a 32-char placeholder workspace S2S token for tests only — not a real secret.
 const testWorkspaceToken = "workspace0123456789abcdef0123456"
 
+// testPlatformUserID is a valid UUID used as PAYMENT_PLATFORM_USER_ID in non-dev tests.
+const testPlatformUserID = "00000000-0000-0000-0000-000000000001"
+
+// envDevelopment is the development environment name used as a test constant to satisfy goconst.
+const envDevelopment = "development"
+
 // setValidEnv sets the minimum valid environment variables for a development config.
 func setValidEnv(t *testing.T) {
 	t.Helper()
@@ -82,7 +88,7 @@ func TestLoad_Env_FailClosed(t *testing.T) {
 	}{
 		{
 			name:    "development is valid",
-			env:     "development",
+			env:     envDevelopment,
 			wantErr: false,
 		},
 		{
@@ -147,7 +153,7 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		{
 			// §24.1: dev may omit the secret (verification disabled).
 			name:    "dev with empty secret is allowed",
-			env:     "development",
+			env:     envDevelopment,
 			secret:  "",
 			wantErr: false,
 		},
@@ -169,7 +175,7 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		{
 			// Even in dev a too-short secret is an error (catches typos).
 			name:      "dev with too-short secret is rejected",
-			env:       "development",
+			env:       envDevelopment,
 			secret:    "tooshort",
 			wantErr:   true,
 			errSubstr: "PAYMENT_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters",
@@ -195,7 +201,7 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 		},
 		{
 			name:    "dev with valid 32-char secret passes",
-			env:     "development",
+			env:     envDevelopment,
 			secret:  testHMACSecret,
 			wantErr: false,
 		},
@@ -206,11 +212,12 @@ func TestLoad_GatewayHMAC(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", tc.secret)
-			// Non-dev requires S2S token + workspace config; set them so HMAC is the only variable.
+			// Non-dev requires S2S token + workspace config + platform user ID; set them so HMAC is the only variable.
 			if tc.env == "production" || tc.env == "staging" {
 				t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
-				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "https://workspace:8081")
 				t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
+				t.Setenv("PAYMENT_PLATFORM_USER_ID", testPlatformUserID)
 			}
 
 			_, err := config.Load()
@@ -229,7 +236,7 @@ func TestIsDev(t *testing.T) {
 		env   string
 		isDev bool
 	}{
-		{"development", true},
+		{envDevelopment, true},
 		{"DEVELOPMENT", true},
 		{"production", false},
 		{"staging", false},
@@ -241,11 +248,13 @@ func TestIsDev(t *testing.T) {
 			t.Setenv("PAYMENT_ENV", tc.env)
 			// Non-dev envs require gateway HMAC secret (§24.1 fail-closed),
 			// settlement S2S token (backend-security-design §5.5),
-			// and workspace config (PAYMENT_WORKSPACE_BASE_URL + PAYMENT_WORKSPACE_S2S_TOKEN).
+			// workspace config (PAYMENT_WORKSPACE_BASE_URL + PAYMENT_WORKSPACE_S2S_TOKEN),
+			// and platform user ID (self-transfer guard).
 			t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
 			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
-			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "https://workspace:8081")
 			t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
+			t.Setenv("PAYMENT_PLATFORM_USER_ID", testPlatformUserID)
 
 			cfg, err := config.Load()
 			require.NoError(t, err)
@@ -266,7 +275,7 @@ func TestLoad_SettlementS2SToken(t *testing.T) {
 		{
 			// dev: empty token is allowed (endpoint not yet wired in PR1).
 			name:    "dev with empty token is allowed",
-			env:     "development",
+			env:     envDevelopment,
 			token:   "",
 			wantErr: false,
 		},
@@ -288,7 +297,7 @@ func TestLoad_SettlementS2SToken(t *testing.T) {
 		{
 			// dev: too-short token is rejected (catches typos).
 			name:      "dev with too-short token is rejected",
-			env:       "development",
+			env:       envDevelopment,
 			token:     "tooshort",
 			wantErr:   true,
 			errSubstr: "PAYMENT_SETTLEMENT_S2S_TOKEN, when set, must be at least 32 characters",
@@ -308,7 +317,7 @@ func TestLoad_SettlementS2SToken(t *testing.T) {
 		},
 		{
 			name:    "dev with valid 32-char token passes",
-			env:     "development",
+			env:     envDevelopment,
 			token:   testS2SToken,
 			wantErr: false,
 		},
@@ -318,11 +327,12 @@ func TestLoad_SettlementS2SToken(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_ENV", tc.env)
-			// Provide the HMAC secret + workspace config so they don't interfere with S2S token tests.
-			if tc.env != "development" {
+			// Provide the HMAC secret + workspace config + platform user ID so they don't interfere.
+			if tc.env != envDevelopment {
 				t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
-				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "http://workspace:8081")
+				t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "https://workspace:8081")
 				t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
+				t.Setenv("PAYMENT_PLATFORM_USER_ID", testPlatformUserID)
 			}
 			t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", tc.token)
 
@@ -349,7 +359,7 @@ func TestLoad_WorkspaceConfig(t *testing.T) {
 	}{
 		{
 			name:           "dev: empty workspace config allowed",
-			env:            "development",
+			env:            envDevelopment,
 			baseURL:        "",
 			workspaceToken: "",
 			wantErr:        false,
@@ -365,7 +375,7 @@ func TestLoad_WorkspaceConfig(t *testing.T) {
 		{
 			name:           "production: missing workspace token fails",
 			env:            "production",
-			baseURL:        "http://workspace:8081",
+			baseURL:        "https://workspace:8081",
 			workspaceToken: "",
 			wantErr:        true,
 			errSubstr:      "PAYMENT_WORKSPACE_S2S_TOKEN must be at least 32 characters",
@@ -373,7 +383,7 @@ func TestLoad_WorkspaceConfig(t *testing.T) {
 		{
 			name:           "production: too-short workspace token fails",
 			env:            "production",
-			baseURL:        "http://workspace:8081",
+			baseURL:        "https://workspace:8081",
 			workspaceToken: "tooshort",
 			wantErr:        true,
 			errSubstr:      "PAYMENT_WORKSPACE_S2S_TOKEN must be at least 32 characters",
@@ -381,13 +391,13 @@ func TestLoad_WorkspaceConfig(t *testing.T) {
 		{
 			name:           "production: valid workspace config passes",
 			env:            "production",
-			baseURL:        "http://workspace:8081",
+			baseURL:        "https://workspace:8081",
 			workspaceToken: testWorkspaceToken,
 			wantErr:        false,
 		},
 		{
 			name:           "dev: too-short workspace token fails even in dev",
-			env:            "development",
+			env:            envDevelopment,
 			baseURL:        "http://localhost:8081",
 			workspaceToken: "tooshort",
 			wantErr:        true,
@@ -402,9 +412,10 @@ func TestLoad_WorkspaceConfig(t *testing.T) {
 			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", tc.baseURL)
 			t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", tc.workspaceToken)
 
-			if tc.env != "development" {
+			if tc.env != envDevelopment {
 				t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
 				t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+				t.Setenv("PAYMENT_PLATFORM_USER_ID", testPlatformUserID)
 			}
 
 			_, err := config.Load()
@@ -453,6 +464,222 @@ func TestLoad_DBSchema(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setValidEnv(t)
 			t.Setenv("PAYMENT_DB_SCHEMA", tc.schema)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// setValidNonDevEnv sets up a valid non-dev (production) environment for tests.
+// Only use this when the test subject is something OTHER than the fields set here.
+func setValidNonDevEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("PAYMENT_POSTGRES_DSN", testDSN)
+	t.Setenv("PAYMENT_PORT", "8084")
+	t.Setenv("PAYMENT_LOG_LEVEL", "INFO")
+	t.Setenv("PAYMENT_ENV", "production")
+	t.Setenv("PAYMENT_GATEWAY_HMAC_SECRET", testHMACSecret)
+	t.Setenv("PAYMENT_SETTLEMENT_S2S_TOKEN", testS2SToken)
+	t.Setenv("PAYMENT_WORKSPACE_BASE_URL", "https://workspace:8081")
+	t.Setenv("PAYMENT_WORKSPACE_S2S_TOKEN", testWorkspaceToken)
+	t.Setenv("PAYMENT_PLATFORM_USER_ID", testPlatformUserID)
+}
+
+// TestLoad_WorkspaceBaseURL_HTTPS verifies that non-dev requires https:// scheme (sec MAJOR-3).
+func TestLoad_WorkspaceBaseURL_HTTPS(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		baseURL   string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "production: https:// passes",
+			env:     "production",
+			baseURL: "https://workspace:8081",
+			wantErr: false,
+		},
+		{
+			name:      "production: http:// fails (insecure)",
+			env:       "production",
+			baseURL:   "http://workspace:8081",
+			wantErr:   true,
+			errSubstr: "PAYMENT_WORKSPACE_BASE_URL must use https://",
+		},
+		{
+			name:      "staging: http:// fails (insecure)",
+			env:       "staging",
+			baseURL:   "http://workspace:8081",
+			wantErr:   true,
+			errSubstr: "PAYMENT_WORKSPACE_BASE_URL must use https://",
+		},
+		{
+			name:    "dev: http:// allowed",
+			env:     envDevelopment,
+			baseURL: "http://localhost:8081",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == envDevelopment {
+				setValidEnv(t)
+			} else {
+				setValidNonDevEnv(t)
+				t.Setenv("PAYMENT_ENV", tc.env)
+			}
+
+			t.Setenv("PAYMENT_WORKSPACE_BASE_URL", tc.baseURL)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_PlatformUserID verifies PAYMENT_PLATFORM_USER_ID validation (self-transfer guard).
+func TestLoad_PlatformUserID(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		id        string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "dev: empty ID allowed",
+			env:     envDevelopment,
+			id:      "",
+			wantErr: false,
+		},
+		{
+			name:    "dev: valid UUID allowed",
+			env:     envDevelopment,
+			id:      testPlatformUserID,
+			wantErr: false,
+		},
+		{
+			name:      "dev: invalid UUID rejected",
+			env:       envDevelopment,
+			id:        "not-a-uuid",
+			wantErr:   true,
+			errSubstr: "PAYMENT_PLATFORM_USER_ID must be a valid UUID",
+		},
+		{
+			name:      "production: empty ID rejected (self-transfer guard required)",
+			env:       "production",
+			id:        "",
+			wantErr:   true,
+			errSubstr: "PAYMENT_PLATFORM_USER_ID is required",
+		},
+		{
+			name:    "production: valid UUID passes",
+			env:     "production",
+			id:      testPlatformUserID,
+			wantErr: false,
+		},
+		{
+			name:      "production: invalid UUID rejected",
+			env:       "production",
+			id:        "not-valid-uuid",
+			wantErr:   true,
+			errSubstr: "PAYMENT_PLATFORM_USER_ID must be a valid UUID",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == envDevelopment {
+				setValidEnv(t)
+			} else {
+				setValidNonDevEnv(t)
+			}
+
+			t.Setenv("PAYMENT_PLATFORM_USER_ID", tc.id)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestLoad_Redis_Auth verifies validateRedis (sec MAJOR-2): non-dev requires auth + TLS.
+func TestLoad_Redis_Auth(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		redisURL  string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:     "dev: empty redis allowed (noop publisher)",
+			env:      envDevelopment,
+			redisURL: "",
+			wantErr:  false,
+		},
+		{
+			name:     "dev: unauthenticated redis allowed in dev",
+			env:      envDevelopment,
+			redisURL: "redis://localhost:6379",
+			wantErr:  false,
+		},
+		{
+			name:      "production: unauthenticated redis rejected",
+			env:       "production",
+			redisURL:  "redis://localhost:6379",
+			wantErr:   true,
+			errSubstr: "PAYMENT_REDIS_URL must include authentication",
+		},
+		{
+			name:      "production: redis:// (no TLS) rejected even with auth",
+			env:       "production",
+			redisURL:  "redis://:password@localhost:6379",
+			wantErr:   true,
+			errSubstr: "PAYMENT_REDIS_URL must use rediss://",
+		},
+		{
+			name:     "production: rediss:// with auth passes",
+			env:      "production",
+			redisURL: "rediss://:password@localhost:6379",
+			wantErr:  false,
+		},
+		{
+			name:      "invalid URL rejected in any env",
+			env:       envDevelopment,
+			redisURL:  "not-a-url://[invalid",
+			wantErr:   true,
+			errSubstr: "PAYMENT_REDIS_URL is not a valid Redis URL",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == envDevelopment {
+				setValidEnv(t)
+			} else {
+				setValidNonDevEnv(t)
+			}
+
+			t.Setenv("PAYMENT_REDIS_URL", tc.redisURL)
 
 			_, err := config.Load()
 			if tc.wantErr {

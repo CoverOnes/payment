@@ -4,9 +4,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/viper"
 )
 
@@ -79,6 +82,13 @@ type Config struct {
 	// Dev: may be empty; if set must be ≥32 chars.
 	// Env: PAYMENT_WORKSPACE_S2S_TOKEN
 	WorkspaceS2SToken string `mapstructure:"workspace_s2s_token"`
+
+	// PlatformUserID is the system UUID used as PayerUserID in all settlement
+	// disbursement transactions, ensuring payer != payee (self-transfer guard).
+	// Non-dev (staging/production): REQUIRED, must be a valid non-nil UUID.
+	// Dev: may be empty (zero UUID used as fallback).
+	// Env: PAYMENT_PLATFORM_USER_ID
+	PlatformUserID string `mapstructure:"platform_user_id"`
 }
 
 // Load reads configuration from environment variables (prefix PAYMENT_).
@@ -102,6 +112,7 @@ func Load() (*Config, error) {
 		"settlement_s2s_token": "PAYMENT_SETTLEMENT_S2S_TOKEN",
 		"workspace_base_url":   "PAYMENT_WORKSPACE_BASE_URL",
 		"workspace_s2s_token":  "PAYMENT_WORKSPACE_S2S_TOKEN",
+		"platform_user_id":     "PAYMENT_PLATFORM_USER_ID",
 	}
 
 	for key, envKey := range bindings {
@@ -178,6 +189,8 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateGatewayHMAC()...)
 	errs = append(errs, c.validateSettlementS2SToken()...)
 	errs = append(errs, c.validateWorkspace()...)
+	errs = append(errs, c.validateRedis()...)
+	errs = append(errs, c.validatePlatformUserID()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -249,6 +262,7 @@ func (c *Config) validateSettlementS2SToken() []string {
 
 // validateWorkspace enforces the fail-closed posture for workspace S2S config:
 //   - non-dev (staging/production): WorkspaceBaseURL and WorkspaceS2SToken are REQUIRED.
+//     WorkspaceBaseURL MUST use https:// scheme (sec MAJOR-3).
 //   - dev: may be empty (integration tests mock the workspace endpoint).
 func (c *Config) validateWorkspace() []string {
 	var errs []string
@@ -256,6 +270,11 @@ func (c *Config) validateWorkspace() []string {
 	if !c.IsDev() {
 		if c.WorkspaceBaseURL == "" {
 			errs = append(errs, "PAYMENT_WORKSPACE_BASE_URL is required in non-dev (staging/production) environments")
+		} else {
+			parsed, parseErr := url.ParseRequestURI(c.WorkspaceBaseURL)
+			if parseErr != nil || parsed.Scheme != "https" {
+				errs = append(errs, "PAYMENT_WORKSPACE_BASE_URL must use https:// scheme in non-dev (staging/production) environments")
+			}
 		}
 
 		if len(c.WorkspaceS2SToken) < minS2STokenLen {
@@ -271,4 +290,66 @@ func (c *Config) validateWorkspace() []string {
 	}
 
 	return errs
+}
+
+// validateRedis enforces auth and TLS requirements for PAYMENT_REDIS_URL in non-dev:
+//   - non-dev: URL must include auth (password); prefer rediss:// (TLS); errors if neither.
+//   - dev: may be empty or unauthenticated (local dev Redis is common without auth).
+func (c *Config) validateRedis() []string {
+	if c.RedisURL == "" {
+		// Redis is optional (noop publisher path).
+		return nil
+	}
+
+	var errs []string
+
+	opts, parseErr := redis.ParseURL(c.RedisURL)
+	if parseErr != nil {
+		errs = append(errs, "PAYMENT_REDIS_URL is not a valid Redis URL: "+parseErr.Error())
+		return errs
+	}
+
+	if !c.IsDev() {
+		if opts.Password == "" {
+			errs = append(errs, "PAYMENT_REDIS_URL must include authentication (password) in non-dev (staging/production) environments")
+		}
+
+		if opts.TLSConfig == nil {
+			// TLSConfig is non-nil only for the rediss:// scheme; nil means plain redis:// (no TLS).
+			errs = append(errs, "PAYMENT_REDIS_URL must use rediss:// (TLS) scheme in non-dev (staging/production) environments")
+		}
+	}
+
+	return errs
+}
+
+// validatePlatformUserID enforces that PAYMENT_PLATFORM_USER_ID is set and a valid UUID
+// in non-dev environments (self-transfer guard: payer != payee in disburse transactions).
+func (c *Config) validatePlatformUserID() []string {
+	if c.PlatformUserID != "" {
+		if _, err := uuid.Parse(c.PlatformUserID); err != nil {
+			return []string{"PAYMENT_PLATFORM_USER_ID must be a valid UUID"}
+		}
+	}
+
+	if !c.IsDev() && c.PlatformUserID == "" {
+		return []string{"PAYMENT_PLATFORM_USER_ID is required in non-dev (staging/production) environments"}
+	}
+
+	return nil
+}
+
+// PlatformUserUUID returns the platform user ID as a uuid.UUID.
+// Returns uuid.Nil in dev when not configured.
+func (c *Config) PlatformUserUUID() uuid.UUID {
+	if c.PlatformUserID == "" {
+		return uuid.Nil
+	}
+
+	id, err := uuid.Parse(c.PlatformUserID)
+	if err != nil {
+		return uuid.Nil
+	}
+
+	return id
 }

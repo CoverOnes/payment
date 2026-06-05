@@ -26,11 +26,15 @@ func NewSettlementHandler(svc *service.SettlementService) *SettlementHandler {
 }
 
 // disburseRequest is the request body for POST /v1/settlement/plans/:id/disburse.
+// IdempotencyKey is no longer passed to DisburseMilestoneInput — idempotency is
+// content-addressed by (plan_id, milestone_id, vendor_user_id).
+// The field is intentionally retained in the request body for client compatibility but
+// is not forwarded to the service (removing it from the API body is a separate PR).
 type disburseRequest struct {
 	MilestoneID    string `json:"milestoneId"`
-	Amount         string `json:"amount"`   // decimal string e.g. "3000.00"
-	Currency       string `json:"currency"` // ISO 4217; defaults to "TWD"
-	IdempotencyKey string `json:"idempotencyKey"`
+	Amount         string `json:"amount"`         // decimal string e.g. "3000.00"
+	Currency       string `json:"currency"`       // ISO 4217; defaults to "TWD"
+	IdempotencyKey string `json:"idempotencyKey"` // accepted but unused — content-addressed internally
 }
 
 // Disburse handles POST /v1/settlement/plans/:id/disburse.
@@ -94,12 +98,11 @@ func (h *SettlementHandler) Disburse(c *gin.Context) {
 	}
 
 	if err := h.svc.DisburseMilestone(c.Request.Context(), &service.DisburseMilestoneInput{
-		PlanID:               planID,
-		MilestoneID:          milestoneID,
-		Amount:               amount,
-		Currency:             currency,
-		IdempotencyKeySuffix: req.IdempotencyKey,
-		ActorService:         actorService,
+		PlanID:       planID,
+		MilestoneID:  milestoneID,
+		Amount:       amount,
+		Currency:     currency,
+		ActorService: actorService,
 	}); err != nil {
 		httpx.Err(c, err)
 		return

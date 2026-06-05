@@ -11,10 +11,11 @@ import (
 
 // Settlement plan and allocation sentinel errors.
 var (
-	ErrPlanNotFound          = errors.New("settlement plan not found")
-	ErrPlanAlreadyDisbursed  = errors.New("settlement plan already disbursed")
-	ErrSumInvariantViolation = errors.New("allocation share_bps do not sum to 10000")
-	ErrAllocationNotFound    = errors.New("settlement allocation not found")
+	ErrPlanNotFound                  = errors.New("settlement plan not found")
+	ErrPlanAlreadyDisbursed          = errors.New("settlement plan already disbursed")
+	ErrSumInvariantViolation         = errors.New("allocation share_bps do not sum to 10000")
+	ErrAllocationNotFound            = errors.New("settlement allocation not found")
+	ErrMilestoneDisbursementNotFound = errors.New("settlement milestone disbursement not found")
 )
 
 // PlanStatus represents the lifecycle state of a settlement plan.
@@ -80,6 +81,37 @@ type SettlementAllocation struct {
 	IdempotencyKey  string           `json:"idempotencyKey"`
 	CreatedAt       time.Time        `json:"createdAt"`
 	UpdatedAt       time.Time        `json:"updatedAt"`
+}
+
+// MilestoneDisbursementStatus represents the state of a single per-milestone disburse record.
+type MilestoneDisbursementStatus string
+
+const (
+	MilestoneDisbursementStatusPending   MilestoneDisbursementStatus = "PENDING"
+	MilestoneDisbursementStatusDisbursed MilestoneDisbursementStatus = "DISBURSED"
+	MilestoneDisbursementStatusFailed    MilestoneDisbursementStatus = "FAILED"
+)
+
+// SettlementMilestoneDisbursement is a per-(plan, milestone, vendor) disbursement record.
+//
+// The per-milestone design fixes the multi-milestone correctness bug where the old
+// per-plan allocation status caused milestone 2+ to silently pay nothing because all
+// allocations were already DISBURSED after milestone 1.
+//
+// idempotency_key is content-addressed: "disburse:<plan_id>:<milestone_id>:<vendor_user_id>".
+// UNIQUE(plan_id, milestone_id, vendor_user_id) prevents duplicate rows.
+// NO FK constraints (backend-security-design §1.1).
+type SettlementMilestoneDisbursement struct {
+	ID             uuid.UUID                   `json:"id"`
+	PlanID         uuid.UUID                   `json:"planId"`
+	MilestoneID    uuid.UUID                   `json:"milestoneId"`
+	VendorUserID   uuid.UUID                   `json:"vendorUserId"`
+	Amount         decimal.Decimal             `json:"amount"`
+	TxID           *uuid.UUID                  `json:"txId,omitempty"`
+	Status         MilestoneDisbursementStatus `json:"status"`
+	IdempotencyKey string                      `json:"idempotencyKey"`
+	CreatedAt      time.Time                   `json:"createdAt"`
+	UpdatedAt      time.Time                   `json:"updatedAt"`
 }
 
 // SettlementAuditEntry is an append-only event row in settlement_audit.

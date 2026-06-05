@@ -135,6 +135,7 @@ func run() error {
 	// Settlement store layer.
 	settlementPlanStore := postgres.NewSettlementPlanStore(pool)
 	settlementAllocStore := postgres.NewSettlementAllocationStore(pool)
+	settlementMilestoneDisburseStore := postgres.NewSettlementMilestoneDisbursementStore(pool)
 	settlementAuditStore := postgres.NewSettlementAuditStore(pool)
 	settlementTxMgr := postgres.NewSettlementTxManager(pool)
 
@@ -150,10 +151,11 @@ func run() error {
 	settlementSvc := service.NewSettlementService(
 		settlementPlanStore,
 		settlementAllocStore,
+		settlementMilestoneDisburseStore,
 		settlementAuditStore,
 		settlementTxMgr,
-		txStore,
 		rosterClient,
+		cfg.PlatformUserUUID(),
 	)
 
 	// Start settlement event consumers (workspace.contract_activated + workspace.contract_completed).
