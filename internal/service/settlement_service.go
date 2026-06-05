@@ -384,14 +384,43 @@ func (s *SettlementService) disburseAllocation(
 	}
 
 	if !inserted {
-		// Row already existed — idempotent skip (rev Critical 2 fix).
-		// Return success without re-creating to avoid orphan PENDING rows.
-		slog.Info("per-milestone disbursement already exists; skipping (idempotent)",
+		// Row already existed — fetch it and branch on its current status.
+		// DISBURSED: genuine idempotent skip — vendor was already paid; do NOT re-pay.
+		// FAILED: the prior transaction Create failed, so no transactions row exists.
+		//         Re-try now so that a re-trigger actually pays the previously-failed vendor.
+		// PENDING: defensive — a committed tx must have either succeeded or failed, so
+		//         PENDING persisted across a commit boundary is anomalous; retry like FAILED.
+		existing, fetchErr := disbursements.GetByPlanMilestoneVendor(ctx, in.PlanID, in.MilestoneID, alloc.VendorUserID)
+		if fetchErr != nil {
+			slog.Error("fetch existing disbursement failed",
+				"plan_id", in.PlanID,
+				"milestone_id", in.MilestoneID,
+				"vendor_user_id", alloc.VendorUserID,
+				"err", fetchErr)
+
+			return false, decimal.Zero
+		}
+
+		if existing.Status == domain.MilestoneDisbursementStatusDisbursed {
+			// Already paid — idempotent skip; add to running sum without re-creating a tx.
+			slog.Info("per-milestone disbursement already DISBURSED; skipping (idempotent)",
+				"plan_id", in.PlanID,
+				"milestone_id", in.MilestoneID,
+				"vendor_user_id", alloc.VendorUserID)
+
+			return true, existing.Amount
+		}
+
+		// FAILED or PENDING: attempt to pay now. The prior transactions.Create failed
+		// (status FAILED) or is anomalously stale (status PENDING), so no tx row exists —
+		// safe to create one without risking a duplicate transaction.
+		slog.Info("per-milestone disbursement is retryable; attempting re-pay",
 			"plan_id", in.PlanID,
 			"milestone_id", in.MilestoneID,
-			"vendor_user_id", alloc.VendorUserID)
+			"vendor_user_id", alloc.VendorUserID,
+			"status", existing.Status)
 
-		return true, allocAmt
+		disburseRow = existing // use the existing row's ID for UpdateStatus calls below
 	}
 
 	// Self-transfer guard (Critical fix): PayerUserID = platform system account,
@@ -412,19 +441,17 @@ func (s *SettlementService) disburseAllocation(
 
 	// txTxStore.Create is tx-scoped (passed via WithSettlementTx 5th param).
 	// This ensures the transactions row + disbursement row are written atomically.
+	//
+	// NOTE: ErrDuplicateKey from txTxStore.Create is intentionally NOT handled here.
+	// In the single-tx model, the disbursement row and transaction row are written in the
+	// same DB transaction. If txTxStore.Create were to return ErrDuplicateKey, it would
+	// mean a transaction with the same idempotency_key already exists — but since we only
+	// reach this point on a fresh INSERT (inserted=true) or a FAILED/PENDING retry (where
+	// the prior tx Create failed and no tx row exists), a duplicate is structurally
+	// impossible. Silently "marking DISBURSED" on an unreachable branch would create a
+	// misleading audit trail. If this assumption ever breaks, the ErrDuplicateKey will
+	// surface as a real error and be caught by the generic error handler below.
 	if createErr := txTxStore.Create(ctx, txRow); createErr != nil {
-		if errors.Is(createErr, domain.ErrDuplicateKey) {
-			// transactions row already exists — update disbursement to DISBURSED and skip.
-			// This handles a rare race where the disbursement PENDING was created but the
-			// tx create was retried.
-			slog.Info("transactions row already exists; marking disbursement DISBURSED (idempotent)",
-				"plan_id", in.PlanID,
-				"milestone_id", in.MilestoneID,
-				"vendor_user_id", alloc.VendorUserID)
-
-			return true, allocAmt
-		}
-
 		slog.Error("create transaction row failed; marking disbursement FAILED",
 			"plan_id", in.PlanID,
 			"milestone_id", in.MilestoneID,

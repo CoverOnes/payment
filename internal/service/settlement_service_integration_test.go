@@ -783,6 +783,161 @@ func TestSettlementService_DisburseMilestone_PartialFailure_WithDI(t *testing.T)
 	assert.Equal(t, domain.PlanStatusActive, gotPlan.Status)
 }
 
+// TestSettlementService_DisburseMilestone_FailedVendorRetriable verifies that a vendor
+// whose transactions row Create failed (status=FAILED) is retried on the next DisburseMilestone
+// call for the same (plan, milestone).
+//
+// Scenario:
+//  1. Create a 3-party plan (vendor1 40%, vendor2 30%, vendor3 30%).
+//  2. First DisburseMilestone call: inject a failure for vendor2's tx Create.
+//     → vendor1 DISBURSED, vendor2 FAILED, vendor3 DISBURSED; anyFailed=true.
+//  3. Remove the injection; call DisburseMilestone again with the same (plan, milestone).
+//     → vendor2 must now be DISBURSED with a real tx_id.
+//     → vendor1 and vendor3 must still be DISBURSED and still have exactly ONE tx each
+//     (no double-pay: idempotency for DISBURSED rows is preserved).
+//  4. Plan remains ACTIVE throughout.
+func TestSettlementService_DisburseMilestone_FailedVendorRetriable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1, vendor2, vendor3 := uuid.New(), uuid.New(), uuid.New()
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 4000},
+		service.RosterEntry{VendorUserID: vendor2, ShareBps: 3000},
+		service.RosterEntry{VendorUserID: vendor3, ShareBps: 3000},
+	)
+
+	pool, err := postgres.NewPool(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	realTxMgr := postgres.NewSettlementTxManager(pool)
+	realTxStore := postgres.NewTransactionStore(pool)
+
+	// ── Phase 1: inject failure for vendor2 ──────────────────────────────────
+
+	failMgr := &failingTxManager{
+		delegate:    realTxMgr,
+		failVendor:  vendor2,
+		platformUID: testPlatformUID,
+		txDelegate:  realTxStore,
+	}
+
+	svc := service.NewSettlementService(
+		postgres.NewSettlementPlanStore(pool),
+		postgres.NewSettlementAllocationStore(pool),
+		postgres.NewSettlementMilestoneDisbursementStore(pool),
+		postgres.NewSettlementAuditStore(pool),
+		failMgr,
+		roster,
+		testPlatformUID,
+	)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	milestoneID := uuid.New()
+	amount, _ := decimal.NewFromString("9000.00")
+
+	// First call: vendor2 tx Create is injected to fail → vendor2 FAILED.
+	err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestoneID,
+		Amount:       amount,
+		Currency:     "TWD",
+		ActorService: "test-retry",
+	})
+	require.NoError(t, err, "partial failure must not surface as error; plan stays re-triggerable")
+
+	// Verify initial state: vendor1 DISBURSED, vendor2 FAILED, vendor3 DISBURSED.
+	disburse1, err := svc.GetMilestoneDisbursements(ctx, plan.ID, milestoneID)
+	require.NoError(t, err)
+	require.Len(t, disburse1, 3)
+
+	statusMap := map[uuid.UUID]domain.MilestoneDisbursementStatus{}
+	txIDMap := map[uuid.UUID]*uuid.UUID{}
+	for _, d := range disburse1 {
+		statusMap[d.VendorUserID] = d.Status
+		txIDMap[d.VendorUserID] = d.TxID
+	}
+	assert.Equal(t, domain.MilestoneDisbursementStatusDisbursed, statusMap[vendor1], "vendor1 must be DISBURSED after first call")
+	assert.Equal(t, domain.MilestoneDisbursementStatusFailed, statusMap[vendor2], "vendor2 must be FAILED (injection)")
+	assert.Equal(t, domain.MilestoneDisbursementStatusDisbursed, statusMap[vendor3], "vendor3 must be DISBURSED after first call")
+	assert.Nil(t, txIDMap[vendor2], "vendor2 tx_id must be nil (no tx created on failure)")
+
+	v1TxIDFirst := txIDMap[vendor1]
+	v3TxIDFirst := txIDMap[vendor3]
+	require.NotNil(t, v1TxIDFirst, "vendor1 must have a tx_id")
+	require.NotNil(t, v3TxIDFirst, "vendor3 must have a tx_id")
+
+	// ── Phase 2: re-trigger without injection ────────────────────────────────
+	// Build a service with the real (non-failing) tx manager.
+	svcRetry := service.NewSettlementService(
+		postgres.NewSettlementPlanStore(pool),
+		postgres.NewSettlementAllocationStore(pool),
+		postgres.NewSettlementMilestoneDisbursementStore(pool),
+		postgres.NewSettlementAuditStore(pool),
+		realTxMgr,
+		roster,
+		testPlatformUID,
+	)
+
+	err = svcRetry.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestoneID,
+		Amount:       amount,
+		Currency:     "TWD",
+		ActorService: "test-retry",
+	})
+	require.NoError(t, err, "re-trigger must succeed now that injection is removed")
+
+	// Verify final state: all three DISBURSED, vendor1/vendor3 have the SAME tx_id
+	// (no double-pay), vendor2 has a NEW tx_id.
+	disburse2, err := svc.GetMilestoneDisbursements(ctx, plan.ID, milestoneID)
+	require.NoError(t, err)
+	require.Len(t, disburse2, 3, "still exactly 3 disbursement rows (no duplicates)")
+
+	statusMap2 := map[uuid.UUID]domain.MilestoneDisbursementStatus{}
+	txIDMap2 := map[uuid.UUID]*uuid.UUID{}
+	for _, d := range disburse2 {
+		statusMap2[d.VendorUserID] = d.Status
+		txIDMap2[d.VendorUserID] = d.TxID
+	}
+
+	assert.Equal(t, domain.MilestoneDisbursementStatusDisbursed, statusMap2[vendor1], "vendor1 must remain DISBURSED")
+	assert.Equal(t, domain.MilestoneDisbursementStatusDisbursed, statusMap2[vendor2], "vendor2 must be DISBURSED after re-trigger")
+	assert.Equal(t, domain.MilestoneDisbursementStatusDisbursed, statusMap2[vendor3], "vendor3 must remain DISBURSED")
+
+	// vendor2 must now have a real tx_id.
+	require.NotNil(t, txIDMap2[vendor2], "vendor2 must have a tx_id after re-trigger")
+
+	// vendor1 and vendor3 must have the SAME tx_ids as before (no double-pay).
+	require.NotNil(t, txIDMap2[vendor1], "vendor1 must still have a tx_id")
+	require.NotNil(t, txIDMap2[vendor3], "vendor3 must still have a tx_id")
+	assert.Equal(t, *v1TxIDFirst, *txIDMap2[vendor1], "vendor1 tx_id must be unchanged (idempotent skip, no double-pay)")
+	assert.Equal(t, *v3TxIDFirst, *txIDMap2[vendor3], "vendor3 tx_id must be unchanged (idempotent skip, no double-pay)")
+
+	// vendor2's tx_id must be different from vendor1 and vendor3 (unique tx per vendor).
+	assert.NotEqual(t, *txIDMap2[vendor1], *txIDMap2[vendor2], "vendor2 must have a distinct tx_id from vendor1")
+	assert.NotEqual(t, *txIDMap2[vendor3], *txIDMap2[vendor2], "vendor2 must have a distinct tx_id from vendor3")
+
+	// Plan remains ACTIVE.
+	gotPlan, err := svcRetry.GetPlan(ctx, plan.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.PlanStatusActive, gotPlan.Status, "plan must remain ACTIVE throughout")
+}
+
 // TestSettlementService_GetPlanByContractID verifies the GetPlanByContractID lookup.
 func TestSettlementService_GetPlanByContractID(t *testing.T) {
 	if testing.Short() {

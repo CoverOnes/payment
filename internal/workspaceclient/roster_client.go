@@ -64,6 +64,9 @@ func NewHTTPRosterClient(baseURL, serviceID, serviceToken string) *HTTPRosterCli
 // and returns the frozen ACTIVE-party roster as []service.RosterEntry.
 // Returns an error if the workspace endpoint is unreachable or returns non-200.
 func (c *HTTPRosterClient) GetPartyRoster(ctx context.Context, contractID uuid.UUID) ([]service.RosterEntry, error) {
+	// G107 (gosec): URL built from c.baseURL + uuid.UUID. baseURL is validated at
+	// config load (validateWorkspace enforces https:// prefix); contractID is a
+	// uuid.UUID — not user-controlled. No path traversal or injection is possible.
 	url := fmt.Sprintf("%s/internal/v1/contracts/%s/parties", c.baseURL, contractID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
