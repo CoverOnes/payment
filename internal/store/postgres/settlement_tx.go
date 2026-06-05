@@ -22,10 +22,13 @@ func NewSettlementTxManager(pool *pgxpool.Pool) *SettlementTxManager {
 }
 
 // WithSettlementTx runs fn inside a single Postgres transaction providing
-// transactional access to all three settlement stores.
+// transactional access to all five settlement stores.
 // The plan and allocation stores passed to fn are tx-scoped and expose
 // GetByIDForUpdate / ListByPlanIDForUpdate; these methods are unavailable on
 // pool-backed stores, enforcing that FOR UPDATE only runs inside a transaction.
+// The disbursements store and the transactions store are also tx-scoped so that
+// the transactions row + the settlement_milestone_disbursements row are written
+// atomically in ONE DB transaction (Critical atomicity fix).
 // If fn returns an error the transaction is rolled back; otherwise it is committed.
 func (m *SettlementTxManager) WithSettlementTx(
 	ctx context.Context,
@@ -33,6 +36,8 @@ func (m *SettlementTxManager) WithSettlementTx(
 		ctx context.Context,
 		plans store.TxSettlementPlanStore,
 		allocs store.TxSettlementAllocationStore,
+		disbursements store.SettlementMilestoneDisbursementStore,
+		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
 	) error,
 ) error {
@@ -49,9 +54,11 @@ func (m *SettlementTxManager) WithSettlementTx(
 
 	txPlans := &txSettlementPlanStore{tx: tx}
 	txAllocs := &txSettlementAllocationStore{tx: tx}
+	txDisburse := &txSettlementMilestoneDisbursementStore{tx: tx}
+	txTxStore := &txTransactionStore{tx: tx}
 	txAudit := &txSettlementAuditStore{tx: tx}
 
-	if fnErr := fn(ctx, txPlans, txAllocs, txAudit); fnErr != nil {
+	if fnErr := fn(ctx, txPlans, txAllocs, txDisburse, txTxStore, txAudit); fnErr != nil {
 		return fnErr
 	}
 

@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/CoverOnes/payment/internal/config"
+	"github.com/CoverOnes/payment/internal/consumer"
 	"github.com/CoverOnes/payment/internal/events"
 	"github.com/CoverOnes/payment/internal/handler"
 	"github.com/CoverOnes/payment/internal/platform/logger"
 	"github.com/CoverOnes/payment/internal/service"
 	"github.com/CoverOnes/payment/internal/store/postgres"
+	"github.com/CoverOnes/payment/internal/workspaceclient"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -130,15 +132,54 @@ func run() error {
 	auditStore := postgres.NewAuditStore(pool)
 	txManager := postgres.NewTxManager(pool)
 
+	// Settlement store layer.
+	settlementPlanStore := postgres.NewSettlementPlanStore(pool)
+	settlementAllocStore := postgres.NewSettlementAllocationStore(pool)
+	settlementMilestoneDisburseStore := postgres.NewSettlementMilestoneDisbursementStore(pool)
+	settlementAuditStore := postgres.NewSettlementAuditStore(pool)
+	settlementTxMgr := postgres.NewSettlementTxManager(pool)
+
+	// Workspace roster client (S2S call to workspace to fetch frozen party roster).
+	rosterClient := workspaceclient.NewHTTPRosterClient(
+		cfg.WorkspaceBaseURL,
+		"payment",
+		cfg.WorkspaceS2SToken,
+	)
+
 	// Service layer.
 	txSvc := service.NewTransactionService(txStore, auditStore, txManager, publisher)
+	settlementSvc := service.NewSettlementService(
+		settlementPlanStore,
+		settlementAllocStore,
+		settlementMilestoneDisburseStore,
+		settlementAuditStore,
+		settlementTxMgr,
+		rosterClient,
+		cfg.PlatformUserUUID(),
+	)
+
+	// Start settlement event consumers (workspace.contract_activated + workspace.contract_completed).
+	// Only wired when Redis is available — dev without Redis skips consumers gracefully.
+	if redisClient != nil {
+		settlementConsumer := consumer.NewSettlementConsumer(redisClient, settlementSvc)
+
+		serverCtx, serverCancel := context.WithCancel(context.Background())
+		defer serverCancel()
+
+		go settlementConsumer.Start(serverCtx)
+		slog.Info("settlement event consumer started")
+	} else {
+		slog.Warn("redis not connected; settlement event consumers not started")
+	}
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
-		TransactionSvc:    txSvc,
-		Pool:              pool,
-		Redis:             redisClient,
-		GatewayHMACSecret: cfg.GatewayHMACSecret,
+		TransactionSvc:     txSvc,
+		SettlementSvc:      settlementSvc,
+		Pool:               pool,
+		Redis:              redisClient,
+		GatewayHMACSecret:  cfg.GatewayHMACSecret,
+		SettlementS2SToken: cfg.SettlementS2SToken,
 	})
 
 	srv := &http.Server{

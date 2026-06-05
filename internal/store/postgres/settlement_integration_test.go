@@ -18,9 +18,11 @@ import (
 // Type aliases for the settlement tx callback signature.
 // The tx-scoped variants expose GetByIDForUpdate / ListByPlanIDForUpdate.
 type (
-	storePlanStore  = store.TxSettlementPlanStore
-	storeAllocStore = store.TxSettlementAllocationStore
-	storeAuditEntry = store.SettlementAuditStore
+	storePlanStore          = store.TxSettlementPlanStore
+	storeAllocStore         = store.TxSettlementAllocationStore
+	storeDisburseStore      = store.SettlementMilestoneDisbursementStore
+	storeTxTransactionStore = store.TransactionStore
+	storeAuditEntry         = store.SettlementAuditStore
 )
 
 // newTestPlan returns a valid SettlementPlan for testing.
@@ -337,6 +339,8 @@ func TestSettlementTxManager_Integration(t *testing.T) {
 			ctx context.Context,
 			plans storePlanStore,
 			allocs storeAllocStore,
+			_ storeDisburseStore,
+			_ storeTxTransactionStore,
 			audit storeAuditEntry,
 		) error {
 			// Lock the plan.
@@ -405,6 +409,8 @@ func TestSettlementTxManager_Integration(t *testing.T) {
 			ctx context.Context,
 			plans storePlanStore,
 			_ storeAllocStore,
+			_ storeDisburseStore,
+			_ storeTxTransactionStore,
 			_ storeAuditEntry,
 		) error {
 			// Mutate — but then return error to trigger rollback.

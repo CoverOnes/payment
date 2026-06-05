@@ -51,6 +51,9 @@ type SettlementPlanStore interface {
 	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PlanStatus) error
 	// CountByMultiContractID returns the number of non-canceled plans for a contract.
 	CountByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (int, error)
+	// GetByMultiContractID returns the active (non-canceled) settlement plan for a contract.
+	// Returns nil, nil if no plan exists.
+	GetByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error)
 }
 
 // SettlementAllocationStore defines persistence operations for settlement allocations.
@@ -84,6 +87,9 @@ type TxSettlementPlanStore interface {
 	// GetByIDForUpdate fetches a plan with SELECT ... FOR UPDATE inside a DB transaction.
 	// Used by the disburse service to lock the plan before checking/updating allocations (TOCTOU).
 	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.SettlementPlan, error)
+	// GetByMultiContractIDForUpdate fetches the active plan for a contract with FOR UPDATE.
+	// Used by the disburse service when the plan_id is unknown and must be resolved under lock.
+	GetByMultiContractIDForUpdate(ctx context.Context, multiContractID uuid.UUID) (*domain.SettlementPlan, error)
 }
 
 // TxSettlementAllocationStore extends SettlementAllocationStore with SELECT ... FOR UPDATE,
@@ -96,11 +102,30 @@ type TxSettlementAllocationStore interface {
 	ListByPlanIDForUpdate(ctx context.Context, planID uuid.UUID) ([]*domain.SettlementAllocation, error)
 }
 
+// SettlementMilestoneDisbursementStore defines persistence for per-milestone disbursement records.
+// Each (plan_id, milestone_id, vendor_user_id) triple has at most one row — the UNIQUE index
+// enforces idempotency at the DB level.
+type SettlementMilestoneDisbursementStore interface {
+	// Create inserts a new disbursement record using ON CONFLICT DO NOTHING.
+	// Returns (true, nil) when the row was inserted, (false, nil) when it already existed
+	// (idempotent skip — no transaction abort), or (false, err) on unexpected error.
+	Create(ctx context.Context, d *domain.SettlementMilestoneDisbursement) (inserted bool, err error)
+	// GetByPlanMilestoneVendor fetches a disbursement by the (plan, milestone, vendor) triple.
+	// Returns ErrMilestoneDisbursementNotFound if none.
+	GetByPlanMilestoneVendor(ctx context.Context, planID, milestoneID, vendorUserID uuid.UUID) (*domain.SettlementMilestoneDisbursement, error)
+	// ListByPlanMilestone returns all disbursements for a (plan, milestone) pair, ordered by created_at ASC.
+	ListByPlanMilestone(ctx context.Context, planID, milestoneID uuid.UUID) ([]*domain.SettlementMilestoneDisbursement, error)
+	// UpdateStatus updates the status, tx_id, and updated_at columns.
+	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.MilestoneDisbursementStatus, txID *uuid.UUID) error
+}
+
 // SettlementTxManager runs a function inside a single Postgres transaction, providing
-// transactional access to all three settlement stores atomically.
+// transactional access to all five settlement stores atomically.
 // The tx-scoped plan and allocation stores expose FOR UPDATE methods unavailable
 // on the pool-backed stores, ensuring row-level locking can only happen inside a tx.
-// Used by the disburse service: lock plan + lock allocations + write audit in one tx.
+// txTxStore is a tx-scoped TransactionStore ensuring the transactions row and the
+// settlement_milestone_disbursements row are written in ONE transaction (atomicity fix).
+// Used by the disburse service: lock plan + lock allocations + write disbursement + write tx + write audit.
 type SettlementTxManager interface {
 	WithSettlementTx(
 		ctx context.Context,
@@ -108,6 +133,8 @@ type SettlementTxManager interface {
 			ctx context.Context,
 			plans TxSettlementPlanStore,
 			allocs TxSettlementAllocationStore,
+			disbursements SettlementMilestoneDisbursementStore,
+			txTxStore TransactionStore,
 			audit SettlementAuditStore,
 		) error,
 	) error
