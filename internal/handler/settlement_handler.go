@@ -58,15 +58,19 @@ type disburseRequest struct {
 
 // Disburse handles POST /v1/settlement/plans/:id/disburse.
 // This is a manual re-trigger for a milestone disburse — used when the event
-// consumer failed or a partial-failure allocation needs re-triggering.
+// consumer failed or needs re-triggering.
 //
 // Auth: RequireValidIdentity + RequireTier(3) + VerifyGatewaySignature (from router group)
 // AND RequireServiceIdentity (settlement S2S token — workspace or ops caller).
 //
+// Fix #3 (Critical): all-or-nothing model. The 207 partial_failure and 502 paths have
+// been removed because they were structurally unreachable in production: a real DB error
+// aborts the shared pgx transaction, making "some vendors paid, some failed" an illusion.
+// DisburseMilestone now returns an error on any vendor failure, rolling back all vendors.
+//
 // Response discriminants:
-//   - 200 {status:"disbursed"}          — all vendors paid (or idempotently skipped).
-//   - 207 {status:"partial_failure"}    — some vendors paid, some failed; per-vendor outcomes included.
-//   - 502 {status:"failed"}             — every vendor failed; no money moved this call.
+//   - 200 {status:"disbursed"}  — all vendors paid (or idempotently skipped).
+//   - 4xx/5xx via httpx.Err     — any error rolls back the entire disbursement.
 //
 // IdempotencyKey in the request body is accepted but has no effect — see disburseRequest doc.
 func (h *SettlementHandler) Disburse(c *gin.Context) {
@@ -131,27 +135,13 @@ func (h *SettlementHandler) Disburse(c *gin.Context) {
 		return
 	}
 
-	// Build an honest response based on per-vendor outcomes.
-	// All succeeded (or idempotently skipped) → 200 disbursed.
-	// Some failed → 207 partial_failure with per-vendor breakdown.
-	// All failed → 502 failed (no money moved this call).
-	base := gin.H{
+	// Fix #3 (Critical): all-or-nothing — on success all vendors are paid.
+	// Any vendor error causes DisburseMilestone to return an error (handled above)
+	// and rolls back the entire pgx transaction, so we only reach here on full success.
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"planId":      planID,
 		"milestoneId": milestoneID,
 		"vendors":     result.Outcomes,
-	}
-
-	switch {
-	case result.FailedCount == 0:
-		base["status"] = "disbursed"
-		c.JSON(http.StatusOK, gin.H{"data": base})
-
-	case result.DisbursedCount > 0:
-		base["status"] = "partial_failure"
-		c.JSON(http.StatusMultiStatus, gin.H{"data": base})
-
-	default:
-		base["status"] = "failed"
-		c.JSON(http.StatusBadGateway, gin.H{"data": base})
-	}
+		"status":      "disbursed",
+	}})
 }

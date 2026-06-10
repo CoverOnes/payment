@@ -105,9 +105,12 @@ tasks:
 
   partition:drop-old:
     desc: |
-      Drop monthly transaction_audit partitions whose upper bound is older than
+      Drop monthly transaction_audit partitions whose month is older than
       now() - interval '730 days' (2-year compliance window).
-      Identifies candidate partitions via pg_inherits + pg_class + pg_constraint.
+      Fix #4 (Major): derive the candidate from the partition name (*_pYYYYMM) instead of
+      pg_constraint contype='x' (which never matches declarative partition bounds — they live
+      in pg_class.relpartbound, not pg_constraint). The old pg_constraint JOIN matched zero
+      rows, so no partition was ever dropped (silent retention failure).
       Idempotent and safe to run repeatedly.
       Requires: PAYMENT_POSTGRES_DSN env var.
     cmds:
@@ -120,17 +123,15 @@ tasks:
             FOR rec IN
                 SELECT c.relname AS part_name
                 FROM   pg_inherits i
-                JOIN   pg_class   c  ON c.oid  = i.inhrelid
-                JOIN   pg_class   p  ON p.oid  = i.inhparent
-                JOIN   pg_constraint con ON con.conrelid = c.oid
-                                        AND con.contype  = 'x'  -- check constraint (partition bound)
+                JOIN   pg_class   c ON c.oid = i.inhrelid
+                JOIN   pg_class   p ON p.oid = i.inhparent
                 WHERE  p.relname = 'transaction_audit'
                   AND  c.relname <> 'transaction_audit_default'
-                  -- The partition bound upper value is stored in pg_get_expr; cast and compare.
-                  AND  (SELECT split_part(
-                               replace(pg_get_expr(con.conbin, con.conrelid), 'occurred_at < ''', ''),
-                               '''', 1)::timestamptz
-                       ) < now() - interval '730 days'
+                  -- Partition name format: transaction_audit_pYYYYMM (e.g. _p202301).
+                  -- The month represented by the partition starts at to_date(right(relname,6),'YYYYMM').
+                  -- Add 1 month to get the exclusive upper bound, then compare against the retention window.
+                  AND  to_date(right(c.relname, 6), 'YYYYMM') + interval '1 month'
+                       < now() - interval '730 days'
             LOOP
                 EXECUTE format('DROP TABLE IF EXISTS %I', rec.part_name);
                 RAISE NOTICE 'Dropped old partition %', rec.part_name;
@@ -167,10 +168,11 @@ tasks:
 
   partition:drop-old-settlement:
     desc: |
-      Drop monthly settlement_audit partitions whose upper bound is older than
+      Drop monthly settlement_audit partitions whose month is older than
       now() - interval '730 days' (2-year compliance window).
-      Mirrors partition:drop-old but operates on the settlement_audit parent table.
-      Identifies candidate partitions via pg_inherits + pg_class + pg_constraint.
+      Fix #4 (Major): mirrors partition:drop-old fix — derive candidate from partition
+      name (*_pYYYYMM) instead of pg_constraint contype='x' (which never matches
+      declarative partition bounds, so the old query silently dropped nothing).
       Idempotent and safe to run repeatedly.
       Requires: PAYMENT_POSTGRES_DSN env var.
     cmds:
@@ -183,17 +185,15 @@ tasks:
             FOR rec IN
                 SELECT c.relname AS part_name
                 FROM   pg_inherits i
-                JOIN   pg_class   c  ON c.oid  = i.inhrelid
-                JOIN   pg_class   p  ON p.oid  = i.inhparent
-                JOIN   pg_constraint con ON con.conrelid = c.oid
-                                        AND con.contype  = 'x'  -- check constraint (partition bound)
+                JOIN   pg_class   c ON c.oid = i.inhrelid
+                JOIN   pg_class   p ON p.oid = i.inhparent
                 WHERE  p.relname = 'settlement_audit'
                   AND  c.relname <> 'settlement_audit_default'
-                  -- The partition bound upper value is stored in pg_get_expr; cast and compare.
-                  AND  (SELECT split_part(
-                               replace(pg_get_expr(con.conbin, con.conrelid), 'occurred_at < ''', ''),
-                               '''', 1)::timestamptz
-                       ) < now() - interval '730 days'
+                  -- Partition name format: settlement_audit_pYYYYMM (e.g. _p202301).
+                  -- The month represented by the partition starts at to_date(right(relname,6),'YYYYMM').
+                  -- Add 1 month to get the exclusive upper bound, then compare against the retention window.
+                  AND  to_date(right(c.relname, 6), 'YYYYMM') + interval '1 month'
+                       < now() - interval '730 days'
             LOOP
                 EXECUTE format('DROP TABLE IF EXISTS %I', rec.part_name);
                 RAISE NOTICE 'Dropped old partition %', rec.part_name;

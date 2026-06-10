@@ -67,7 +67,13 @@ func translate(err error) (code string, status int, message string, details any)
 		return "UNAUTHORIZED", http.StatusUnauthorized, "unauthorized", nil
 
 	case errors.Is(err, domain.ErrValidation):
-		return "VALIDATION_ERROR", http.StatusBadRequest, err.Error(), nil
+		// Fix #5 (Major): return a fixed client-safe message instead of err.Error().
+		// The wrapped error string can contain internal IDs and invariants
+		// (e.g. "party roster is empty for contract <uuid>", "frozen_party_count %d != %d").
+		// The full detail is logged below via slog so it is still observable server-side.
+		slog.Warn("validation error", "err", err)
+
+		return "VALIDATION_ERROR", http.StatusBadRequest, "validation error", nil
 
 	default:
 		slog.Error("unhandled internal error", "err", err)

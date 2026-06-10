@@ -222,7 +222,10 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 		currency = "TWD"
 	}
 
-	result, err := c.svc.DisburseMilestone(callCtx, &service.DisburseMilestoneInput{
+	// Fix #3 (Critical): all-or-nothing model. DisburseMilestone now returns an error
+	// on any vendor DB failure, rolling back all vendors atomically. The partial-failure
+	// log branch has been removed because it was unreachable in production.
+	_, err = c.svc.DisburseMilestone(callCtx, &service.DisburseMilestoneInput{
 		PlanID:       plan.ID,
 		MilestoneID:  evt.Data.MilestoneID,
 		Amount:       evt.Data.Amount,
@@ -230,22 +233,11 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 		ActorService: "payment-consumer",
 	})
 	if err != nil {
-		slog.Error("settlement consumer: DisburseMilestone failed",
+		slog.Error("settlement consumer: DisburseMilestone failed; event will be retried",
 			"event_id", evt.EventID,
 			"plan_id", plan.ID,
 			"milestone_id", evt.Data.MilestoneID,
 			"err", err)
-
-		return
-	}
-
-	if result.FailedCount > 0 {
-		slog.Warn("settlement consumer: milestone disburse partial failure; plan re-triggerable",
-			"event_id", evt.EventID,
-			"plan_id", plan.ID,
-			"milestone_id", evt.Data.MilestoneID,
-			"disbursed", result.DisbursedCount,
-			"failed", result.FailedCount)
 
 		return
 	}
