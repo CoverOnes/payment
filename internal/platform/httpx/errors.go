@@ -54,6 +54,9 @@ func translate(err error) (code string, status int, message string, details any)
 	case errors.Is(err, domain.ErrTransactionNotFound):
 		return "TRANSACTION_NOT_FOUND", http.StatusNotFound, "transaction not found", nil
 
+	case errors.Is(err, domain.ErrPlanNotFound):
+		return "PLAN_NOT_FOUND", http.StatusNotFound, "settlement plan not found", nil
+
 	case errors.Is(err, domain.ErrInvalidTransition):
 		return "INVALID_TRANSITION", http.StatusUnprocessableEntity, "invalid state transition", nil
 

@@ -203,8 +203,24 @@ func buildStubRouter(stub handler.SettlementDisburser) http.Handler {
 	// Mirror the router group structure from NewRouter — identity + service token guards.
 	grp := r.Group("/v1/settlement")
 	grp.POST("/plans/:id/disburse", h.Disburse)
+	grp.POST("/plans/:id/complete", h.CompletePlan)
 
 	return r
+}
+
+// completePlanReq builds a POST /v1/settlement/plans/:id/complete request.
+func completePlanReq(t *testing.T, planID string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+planID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	return req
 }
 
 // disburseBodyWithKey builds a disburse request body with the given idempotency key.
@@ -410,6 +426,124 @@ func TestDisburseResult_Fields(t *testing.T) {
 	assert.Equal(t, "DISBURSED", result.Outcomes[0].Status)
 	assert.Equal(t, vendor2, result.Outcomes[1].VendorUserID)
 	assert.Equal(t, "DISBURSED", result.Outcomes[1].Status)
+}
+
+// ─── CompletePlan handler tests ──────────────────────────────────────────────
+
+// TestSettlementHandler_CompletePlan_MissingServiceToken verifies that a request
+// without X-Service-Token (missing service identity) returns 401.
+// Uses the full test router (buildTestRouter) which enforces RequireServiceIdentity.
+func TestSettlementHandler_CompletePlan_MissingServiceToken(t *testing.T) {
+	r := buildTestRouter()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+testPlanID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Id", "00000000-0000-0000-0000-000000000003")
+	req.Header.Set("X-Kyc-Tier", "3")
+	// X-Service-Token intentionally omitted.
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "missing service token must return 401")
+}
+
+// TestSettlementHandler_CompletePlan_WrongServiceToken verifies that an incorrect
+// X-Service-Token returns 401.
+func TestSettlementHandler_CompletePlan_WrongServiceToken(t *testing.T) {
+	r := buildTestRouter()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+testPlanID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Id", "00000000-0000-0000-0000-000000000003")
+	req.Header.Set("X-Kyc-Tier", "3")
+	req.Header.Set("X-Service-Id", "workspace")
+	req.Header.Set("X-Service-Token", "wrong-token-that-does-not-match")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "wrong service token must return 401")
+}
+
+// TestSettlementHandler_CompletePlan_InvalidPlanID verifies that a non-UUID plan id
+// is rejected with 400 before the service is called.
+func TestSettlementHandler_CompletePlan_InvalidPlanID(t *testing.T) {
+	stub := &stubDisburser{}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, "not-a-valid-uuid"))
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "VALIDATION_ERROR", errBody["code"])
+}
+
+// TestSettlementHandler_CompletePlan_Success verifies that when CompletePlan succeeds
+// the response is 200 with status "completed".
+func TestSettlementHandler_CompletePlan_Success(t *testing.T) {
+	stub := &stubDisburser{err: nil}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	data, _ := resp["data"].(map[string]any)
+	assert.Equal(t, "completed", data["status"])
+	assert.Equal(t, testPlanID, data["planId"])
+}
+
+// TestSettlementHandler_CompletePlan_PlanNotFound verifies that ErrPlanNotFound
+// is surfaced as a 404 response (Fix 2: errors.go maps ErrPlanNotFound → 404).
+func TestSettlementHandler_CompletePlan_PlanNotFound(t *testing.T) {
+	stub := &stubDisburser{err: domain.ErrPlanNotFound}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusNotFound, w.Code, "ErrPlanNotFound must return 404")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "PLAN_NOT_FOUND", errBody["code"])
+}
+
+// TestSettlementHandler_CompletePlan_InvalidTransition verifies that ErrInvalidTransition
+// (plan not ACTIVE — e.g. concurrent completion won the race) returns 422 Unprocessable Entity.
+// ErrInvalidTransition → HTTP 422 is the existing domain mapping in errors.go
+// (StatusUnprocessableEntity = "invalid state transition"); 422 is the correct semantic
+// for a pre-condition failure (plan is not in the expected state).
+func TestSettlementHandler_CompletePlan_InvalidTransition(t *testing.T) {
+	stub := &stubDisburser{
+		err: fmt.Errorf("%w: plan is COMPLETED, cannot transition to COMPLETED", domain.ErrInvalidTransition),
+	}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, "ErrInvalidTransition must return 422")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "INVALID_TRANSITION", errBody["code"])
 }
 
 // Compile-time check: ensure errors sentinel package is used (imported above for ServiceError test).

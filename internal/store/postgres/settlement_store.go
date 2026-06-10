@@ -49,6 +49,10 @@ func (s *txSettlementPlanStore) UpdateStatus(ctx context.Context, id uuid.UUID, 
 	return settlementPlanUpdateStatus(ctx, s.tx, id, status)
 }
 
+func (s *txSettlementPlanStore) CompletePlanAtomic(ctx context.Context, id uuid.UUID) error {
+	return settlementPlanCompleteAtomic(ctx, s.tx, id)
+}
+
 func (s *txSettlementPlanStore) CountByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (int, error) {
 	return settlementPlanCountByMultiContractID(ctx, s.tx, multiContractID)
 }
@@ -76,6 +80,13 @@ func (s *SettlementPlanStore) GetByID(ctx context.Context, id uuid.UUID) (*domai
 // UpdateStatus updates the status and updated_at of a plan.
 func (s *SettlementPlanStore) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PlanStatus) error {
 	return settlementPlanUpdateStatus(ctx, s.q, id, status)
+}
+
+// CompletePlanAtomic atomically transitions a plan from ACTIVE to COMPLETED.
+// Returns ErrInvalidTransition if the plan exists but is not ACTIVE.
+// Returns ErrPlanNotFound if no plan with that ID exists.
+func (s *SettlementPlanStore) CompletePlanAtomic(ctx context.Context, id uuid.UUID) error {
+	return settlementPlanCompleteAtomic(ctx, s.q, id)
 }
 
 // CountByMultiContractID returns the number of non-canceled plans for a contract.
@@ -153,6 +164,37 @@ func settlementPlanUpdateStatus(ctx context.Context, q querier, id uuid.UUID, st
 	}
 
 	return nil
+}
+
+// settlementPlanCompleteAtomic performs an atomic ACTIVE → COMPLETED transition.
+// The WHERE clause guards against concurrent completion (TOCTOU): only one concurrent
+// call can observe RowsAffected == 1; the other observes 0 and returns ErrInvalidTransition.
+// A separate existence check distinguishes "not found" from "not ACTIVE".
+func settlementPlanCompleteAtomic(ctx context.Context, q querier, id uuid.UUID) error {
+	const query = `
+UPDATE settlement_plans
+SET status = 'COMPLETED', updated_at = $2
+WHERE id = $1 AND status = 'ACTIVE'
+`
+
+	tag, err := q.Exec(ctx, query, id, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("complete settlement_plan atomic: %w", err)
+	}
+
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	// 0 rows affected: either the plan doesn't exist or it's not ACTIVE.
+	// Perform a lightweight existence check to distinguish the two cases.
+	plan, getErr := settlementPlanGetByID(ctx, q, id)
+	if getErr != nil {
+		return getErr // propagates ErrPlanNotFound on pgx.ErrNoRows
+	}
+
+	// Plan exists but is not ACTIVE (already COMPLETED or CANCELED).
+	return fmt.Errorf("%w: plan is %s, cannot transition to COMPLETED", domain.ErrInvalidTransition, plan.Status)
 }
 
 func settlementPlanCountByMultiContractID(ctx context.Context, q querier, multiContractID uuid.UUID) (int, error) {

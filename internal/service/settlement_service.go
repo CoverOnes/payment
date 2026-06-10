@@ -647,18 +647,30 @@ func (s *SettlementService) appendAllocationFailedAudit(_ context.Context, in *D
 // dedicated "plan complete" endpoint) after confirming all milestones have been disbursed.
 // Returns ErrPlanNotFound if the plan does not exist.
 // Returns ErrInvalidTransition if the plan is not ACTIVE (already COMPLETED or CANCELED).
+// CompletePlan transitions a plan from ACTIVE to COMPLETED and writes a PLAN_COMPLETED audit entry.
+// Fix #6 (Major): implements the plan-completion transition that was missing (plans stayed ACTIVE
+// forever, never reaching PlanStatusCompleted).
+// TOCTOU fix: uses CompletePlanAtomic (UPDATE ... WHERE id=$1 AND status='ACTIVE') so that two
+// concurrent calls cannot both observe ACTIVE and both write a PLAN_COMPLETED audit entry —
+// exactly one wins the race (RowsAffected == 1); the other receives ErrInvalidTransition.
+//
+// Callers: the workspace service should invoke this (via the manual disburse endpoint or a
+// dedicated "plan complete" endpoint) after confirming all milestones have been disbursed.
+// Returns ErrPlanNotFound if the plan does not exist.
+// Returns ErrInvalidTransition if the plan is not ACTIVE (already COMPLETED or CANCELED).
 func (s *SettlementService) CompletePlan(ctx context.Context, planID uuid.UUID) error {
+	// Fetch the plan first so we have multi_contract_id for the audit payload.
+	// This read is non-locking; the atomic transition below races correctly via the DB guard.
 	plan, err := s.plans.GetByID(ctx, planID)
 	if err != nil {
 		return err
 	}
 
-	if plan.Status != domain.PlanStatusActive {
-		return fmt.Errorf("%w: plan is %s, cannot transition to COMPLETED", domain.ErrInvalidTransition, plan.Status)
-	}
-
-	if updateErr := s.plans.UpdateStatus(ctx, planID, domain.PlanStatusCompleted); updateErr != nil {
-		return fmt.Errorf("update plan to COMPLETED: %w", updateErr)
+	// Atomic ACTIVE → COMPLETED transition: UPDATE ... WHERE id=$1 AND status='ACTIVE'.
+	// If two concurrent calls both pass the GetByID check above, only one will update a row;
+	// the other sees RowsAffected == 0 and receives ErrInvalidTransition from the store.
+	if atomicErr := s.plans.CompletePlanAtomic(ctx, planID); atomicErr != nil {
+		return atomicErr
 	}
 
 	payload, _ := json.Marshal(map[string]any{
