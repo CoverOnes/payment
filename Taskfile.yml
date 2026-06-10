@@ -127,6 +127,12 @@ tasks:
                 JOIN   pg_class   p ON p.oid = i.inhparent
                 WHERE  p.relname = 'transaction_audit'
                   AND  c.relname <> 'transaction_audit_default'
+                  -- M-3: name-format guard — only touch partitions whose name matches
+                  -- the expected _pYYYYMM suffix. Any non-conforming child table (e.g.
+                  -- a manually created one) would make to_date() throw and abort the
+                  -- whole retention run. The regex ensures we never call to_date() on
+                  -- a name that doesn't carry a 6-digit YYYYMM suffix.
+                  AND  c.relname ~ '^transaction_audit_p[0-9]{6}$'
                   -- Partition name format: transaction_audit_pYYYYMM (e.g. _p202301).
                   -- The month represented by the partition starts at to_date(right(relname,6),'YYYYMM').
                   -- Add 1 month to get the exclusive upper bound, then compare against the retention window.
@@ -189,6 +195,12 @@ tasks:
                 JOIN   pg_class   p ON p.oid = i.inhparent
                 WHERE  p.relname = 'settlement_audit'
                   AND  c.relname <> 'settlement_audit_default'
+                  -- M-3: name-format guard — only touch partitions whose name matches
+                  -- the expected _pYYYYMM suffix. Any non-conforming child table (e.g.
+                  -- a manually created one) would make to_date() throw and abort the
+                  -- whole retention run. The regex ensures we never call to_date() on
+                  -- a name that doesn't carry a 6-digit YYYYMM suffix.
+                  AND  c.relname ~ '^settlement_audit_p[0-9]{6}$'
                   -- Partition name format: settlement_audit_pYYYYMM (e.g. _p202301).
                   -- The month represented by the partition starts at to_date(right(relname,6),'YYYYMM').
                   -- Add 1 month to get the exclusive upper bound, then compare against the retention window.

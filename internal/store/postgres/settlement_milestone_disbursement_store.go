@@ -50,6 +50,10 @@ func (s *txSettlementMilestoneDisbursementStore) UpdateStatus(
 	return settlementMilestoneDisbursementUpdateStatus(ctx, s.tx, id, status, txID)
 }
 
+func (s *txSettlementMilestoneDisbursementStore) SumDisbursedByPlanID(ctx context.Context, planID uuid.UUID) (decimal.Decimal, error) {
+	return settlementMilestoneDisbursementSumByPlanID(ctx, s.tx, planID)
+}
+
 // Pool-backed methods.
 
 // Create inserts a new disbursement record using ON CONFLICT DO NOTHING.
@@ -76,6 +80,11 @@ func (s *SettlementMilestoneDisbursementStore) UpdateStatus(
 	ctx context.Context, id uuid.UUID, status domain.MilestoneDisbursementStatus, txID *uuid.UUID,
 ) error {
 	return settlementMilestoneDisbursementUpdateStatus(ctx, s.q, id, status, txID)
+}
+
+// SumDisbursedByPlanID returns the SUM(amount) of all DISBURSED rows for a plan.
+func (s *SettlementMilestoneDisbursementStore) SumDisbursedByPlanID(ctx context.Context, planID uuid.UUID) (decimal.Decimal, error) {
+	return settlementMilestoneDisbursementSumByPlanID(ctx, s.q, planID)
 }
 
 // --- helpers ---
@@ -175,6 +184,28 @@ WHERE id = $1
 	}
 
 	return nil
+}
+
+// settlementMilestoneDisbursementSumByPlanID returns SUM(amount) WHERE plan_id=$1 AND status='DISBURSED'.
+// Returns decimal.Zero when no disbursed rows exist.
+func settlementMilestoneDisbursementSumByPlanID(ctx context.Context, q querier, planID uuid.UUID) (decimal.Decimal, error) {
+	const query = `
+SELECT COALESCE(SUM(amount), 0)::text
+FROM settlement_milestone_disbursements
+WHERE plan_id = $1 AND status = 'DISBURSED'
+`
+
+	var amtStr string
+	if err := q.QueryRow(ctx, query, planID).Scan(&amtStr); err != nil {
+		return decimal.Zero, fmt.Errorf("sum disbursed by plan_id: %w", err)
+	}
+
+	amt, parseErr := decimal.NewFromString(amtStr)
+	if parseErr != nil {
+		return decimal.Zero, fmt.Errorf("parse sum disbursed %q: %w", amtStr, parseErr)
+	}
+
+	return amt, nil
 }
 
 func scanSettlementMilestoneDisbursement(row rowScanner) (*domain.SettlementMilestoneDisbursement, error) {

@@ -3,7 +3,9 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -21,11 +23,14 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// ─── Test helpers ────────────────────────────────────────────────────────────
+// ─── TestMain singleton container ────────────────────────────────────────────
+// One container + one migration run for the entire package.
+// Each test function uses the shared DSN; test isolation is achieved by using
+// unique UUIDs for all records (no shared state between tests).
 
-func startTestDB(t *testing.T) string {
-	t.Helper()
+var sharedDSN string
 
+func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	ctr, err := tcpostgres.Run(
@@ -36,25 +41,38 @@ func startTestDB(t *testing.T) string {
 		tcpostgres.WithPassword("testpass"),
 		tcpostgres.BasicWaitStrategies(),
 	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: start postgres: %v\n", err)
+		os.Exit(1)
+	}
 
 	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: connection string: %v\n", err)
+		_ = ctr.Terminate(ctx)
+		os.Exit(1)
+	}
 
-	return dsn
+	// Run migrations once against the shared container.
+	if err := applyMigrations(ctx, dsn); err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: migrate: %v\n", err)
+		_ = ctr.Terminate(ctx)
+		os.Exit(1)
+	}
+
+	sharedDSN = dsn
+	code := m.Run()
+
+	_ = ctr.Terminate(ctx)
+	os.Exit(code)
 }
 
-func runMigrations(t *testing.T, ctx context.Context, dsn string) {
-	t.Helper()
-
+// applyMigrations runs all embedded *.up.sql files against dsn. Used by TestMain only.
+func applyMigrations(ctx context.Context, dsn string) error {
 	pool, err := postgres.NewPool(ctx, dsn)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("new pool: %w", err)
+	}
 
 	defer pool.Close()
 
@@ -71,18 +89,51 @@ func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 
 		return nil
 	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+	if err != nil {
+		return fmt.Errorf("walk migrations FS: %w", err)
+	}
+
+	if len(upFiles) == 0 {
+		return fmt.Errorf("no *.up.sql files found in embedded FS")
+	}
 
 	sort.Strings(upFiles)
 
 	for _, file := range upFiles {
 		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
+		if readErr != nil {
+			return fmt.Errorf("read migration %s: %w", file, readErr)
+		}
 
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s", file)
+		if _, execErr := pool.Exec(ctx, string(data)); execErr != nil {
+			return fmt.Errorf("apply migration %s: %w", file, execErr)
+		}
 	}
+
+	return nil
+}
+
+// ─── Test helpers ────────────────────────────────────────────────────────────
+
+// sharedDB returns the shared DSN. Skips integration tests in short mode.
+func sharedDB(t *testing.T) string {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	return sharedDSN
+}
+
+// Kept for legacy call sites that previously called startTestDB + runMigrations
+// inline. Now simply returns the shared DSN (migrations already applied by TestMain).
+func startTestDB(t *testing.T) string {
+	return sharedDB(t)
+}
+
+func runMigrations(_ *testing.T, _ context.Context, _ string) {
+	// No-op: migrations applied once in TestMain.
 }
 
 // ─── Stub roster client ───────────────────────────────────────────────────────
@@ -1588,4 +1639,105 @@ func TestSettlementService_CompletePlan(t *testing.T) {
 		require.Error(t, err)
 		require.ErrorIs(t, err, domain.ErrPlanNotFound)
 	})
+}
+
+// ─── M-1: cumulative disbursement cap ─────────────────────────────────────────
+
+// TestSettlementService_DisburseMilestone_CumulativeCap verifies the per-plan cumulative
+// disbursement cap (M-1 fix): when plan.TotalAmount > 0, the sum of all DISBURSED milestone
+// amounts must not exceed the plan total. The over-cap milestone is rejected with ErrValidation.
+//
+// Scenario:
+//  1. Create a 2-vendor plan (60/40) with TotalAmount = 5000.00.
+//  2. Disburse milestone 1 (3000.00) → succeeds; cumulative = 3000.00.
+//  3. Disburse milestone 2 (2001.00) → rejected (3000+2001 > 5000) with ErrValidation.
+//  4. Disburse milestone 2 (2000.00) → succeeds (3000+2000 == 5000, at cap exactly).
+//  5. Disburse any further milestone → rejected (5000+anything > 5000) with ErrValidation.
+func TestSettlementService_DisburseMilestone_CumulativeCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	vendor1, vendor2 := uuid.New(), uuid.New()
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 6000},
+		service.RosterEntry{VendorUserID: vendor2, ShareBps: 4000},
+	)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	totalAmount, _ := decimal.NewFromString("5000.00")
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		TotalAmount:     totalAmount,
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must be persisted at creation")
+
+	milestone1 := uuid.New()
+	amount1, _ := decimal.NewFromString("3000.00")
+
+	// Milestone 1: 3000 of 5000 — under cap.
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone1,
+		Amount:       amount1,
+		Currency:     "TWD",
+		ActorService: "test-cap",
+	})
+	require.NoError(t, err, "first milestone (3000/5000) must succeed")
+
+	milestone2 := uuid.New()
+	overCapAmt, _ := decimal.NewFromString("2001.00")
+
+	// Milestone 2 over cap: 3000 + 2001 = 5001 > 5000.
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone2,
+		Amount:       overCapAmt,
+		Currency:     "TWD",
+		ActorService: "test-cap",
+	})
+	require.Error(t, err, "over-cap milestone must be rejected")
+	require.ErrorIs(t, err, domain.ErrValidation, "over-cap must return ErrValidation")
+
+	// No disbursement rows for milestone2 (rejected before any DB write).
+	d2, listErr := svc.GetMilestoneDisbursements(ctx, plan.ID, milestone2)
+	require.NoError(t, listErr)
+	assert.Empty(t, d2, "over-cap milestone must leave no disbursement rows")
+
+	// Milestone 2 exactly at cap: 3000 + 2000 = 5000.
+	exactCapAmt, _ := decimal.NewFromString("2000.00")
+	milestone2b := uuid.New()
+
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone2b,
+		Amount:       exactCapAmt,
+		Currency:     "TWD",
+		ActorService: "test-cap",
+	})
+	require.NoError(t, err, "milestone exactly at cap (3000+2000=5000) must succeed")
+
+	// Any further milestone should be rejected (cumulative is now 5000 == total).
+	milestone3 := uuid.New()
+	smallAmt, _ := decimal.NewFromString("0.01")
+
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone3,
+		Amount:       smallAmt,
+		Currency:     "TWD",
+		ActorService: "test-cap",
+	})
+	require.Error(t, err, "any amount past the cap must be rejected")
+	require.ErrorIs(t, err, domain.ErrValidation, "over-cap must return ErrValidation")
 }

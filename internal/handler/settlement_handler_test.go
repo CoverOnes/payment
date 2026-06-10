@@ -188,6 +188,10 @@ func (s *stubDisburser) DisburseMilestone(
 	return s.result, s.err
 }
 
+func (s *stubDisburser) CompletePlan(_ context.Context, _ uuid.UUID) error {
+	return s.err
+}
+
 // buildStubRouter wires a Gin engine with the given stub disburser so that
 // handler-level tests can control the DisburseMilestone outcome without a DB.
 func buildStubRouter(stub handler.SettlementDisburser) http.Handler {

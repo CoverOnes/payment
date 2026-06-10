@@ -21,6 +21,7 @@ const maxDisburseIdempotencyKeyLen = 255
 // Defined here to allow handler-level unit tests to inject stubs without a DB.
 type SettlementDisburser interface {
 	DisburseMilestone(ctx context.Context, in *service.DisburseMilestoneInput) (*service.DisburseResult, error)
+	CompletePlan(ctx context.Context, planID uuid.UUID) error
 }
 
 // SettlementHandler handles settlement-related HTTP endpoints.
@@ -143,5 +144,38 @@ func (h *SettlementHandler) Disburse(c *gin.Context) {
 		"milestoneId": milestoneID,
 		"vendors":     result.Outcomes,
 		"status":      "disbursed",
+	}})
+}
+
+// CompletePlan handles POST /v1/settlement/plans/:id/complete.
+// Transitions the plan from ACTIVE to COMPLETED and writes a PLAN_COMPLETED audit entry.
+//
+// Auth: RequireValidIdentity + RequireTier(3) + VerifyGatewaySignature (from router group)
+// AND RequireServiceIdentity (settlement S2S token — workspace or ops caller).
+//
+// CompletePlan wiring: this endpoint must be called by the workspace service (or an ops
+// operator) after confirming all milestones have been disbursed. The consumer-call approach
+// was not chosen because the contract_completed event does not carry an "isLastMilestone"
+// signal, so there is no reliable way for the payment service to detect completion autonomously.
+//
+// Response discriminants:
+//   - 200 {status:"completed"} — plan transitioned to COMPLETED.
+//   - 404 via httpx.Err        — plan not found.
+//   - 409 via httpx.Err        — plan is not ACTIVE (ErrInvalidTransition).
+func (h *SettlementHandler) CompletePlan(c *gin.Context) {
+	planID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "plan id must be a valid UUID")
+		return
+	}
+
+	if err := h.svc.CompletePlan(c.Request.Context(), planID); err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"planId": planID,
+		"status": "completed",
 	}})
 }

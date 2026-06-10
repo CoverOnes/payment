@@ -76,6 +76,11 @@ type CreatePlanInput struct {
 	TenderID uuid.UUID
 	// Currency is the ISO 4217 settlement currency (e.g. "TWD").
 	Currency string
+	// TotalAmount is the contract total disbursement cap (M-1 fix).
+	// Must be set at plan creation so DisburseMilestone can enforce the cumulative cap.
+	// When the contract_activated event carries the total, pass it here; otherwise
+	// workspace MUST add totalAmount to the contract_activated event (cross-service follow-up).
+	TotalAmount decimal.Decimal
 	// IdempotencyKey scopes plan creation; use "contract_activated:<eventId>".
 	IdempotencyKey string
 }
@@ -148,7 +153,7 @@ func buildPlanWithAllocations(in *CreatePlanInput, roster []RosterEntry) (*domai
 		MultiContractID:  in.MultiContractID,
 		TenderID:         in.TenderID,
 		Status:           domain.PlanStatusActive,
-		TotalAmount:      decimal.Zero,
+		TotalAmount:      in.TotalAmount,
 		Currency:         in.Currency,
 		FrozenPartyCount: len(roster),
 		IdempotencyKey:   in.IdempotencyKey,
@@ -339,6 +344,23 @@ func (s *SettlementService) disburseMilestoneTx(
 
 	if plan.Status == domain.PlanStatusCanceled {
 		return fmt.Errorf("%w: plan is CANCELED", domain.ErrInvalidTransition)
+	}
+
+	// M-1 (Major): cumulative disbursement cap. Only enforced when plan.TotalAmount > 0
+	// (zero means cap was not set at creation — treated as uncapped, backwards-compatible).
+	if plan.TotalAmount.GreaterThan(decimal.Zero) {
+		sumDisbursed, sumErr := disbursements.SumDisbursedByPlanID(ctx, in.PlanID)
+		if sumErr != nil {
+			return fmt.Errorf("query cumulative disbursed sum: %w", sumErr)
+		}
+
+		if sumDisbursed.Add(in.Amount).GreaterThan(plan.TotalAmount) {
+			return fmt.Errorf("%w: cumulative disbursed %s + incoming %s exceeds plan total_amount %s",
+				domain.ErrValidation,
+				sumDisbursed.StringFixed(2),
+				in.Amount.StringFixed(2),
+				plan.TotalAmount.StringFixed(2))
+		}
 	}
 
 	// Fix #2 (Major): assert currency matches the frozen plan currency so that a
@@ -570,10 +592,17 @@ func (s *SettlementService) postDisburseCheck(
 // appendAllocationFailedAudit writes an ALLOCATION_FAILED audit entry for each vendor
 // allocation after a disburse transaction rolls back.
 // Fix #6 (Major): these out-of-tx writes are the only DB record of a failed disburse attempt.
+// M-2 (Major): uses an independent context.WithTimeout(context.Background(), 10*time.Second)
+// so the audit write is not silently dropped when the caller ctx is already canceled or timed out.
 // Best-effort: fetching allocations or individual audit writes may fail (e.g., DB unavailable
 // during the same outage that caused the tx failure); each error is logged but not propagated.
-func (s *SettlementService) appendAllocationFailedAudit(ctx context.Context, in *DisburseMilestoneInput, txErr error) {
-	allocs, listErr := s.allocs.ListByPlanID(ctx, in.PlanID)
+//
+//nolint:contextcheck // intentional: independent context so failure-audit survives caller ctx cancellation (M-2)
+func (s *SettlementService) appendAllocationFailedAudit(_ context.Context, in *DisburseMilestoneInput, txErr error) {
+	auditCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	allocs, listErr := s.allocs.ListByPlanID(auditCtx, in.PlanID)
 	if listErr != nil {
 		slog.Error("appendAllocationFailedAudit: cannot list allocations for audit",
 			"plan_id", in.PlanID,
@@ -584,15 +613,16 @@ func (s *SettlementService) appendAllocationFailedAudit(ctx context.Context, in 
 	}
 
 	for _, alloc := range allocs {
+		// M-4: store only error type/class, not raw error string (which may contain SQL internals).
 		payload, _ := json.Marshal(map[string]any{
 			"milestone_id":   in.MilestoneID,
 			"vendor_user_id": alloc.VendorUserID,
-			"reason":         txErr.Error(),
+			"reason":         fmt.Sprintf("tx_error:%T", txErr),
 		})
 
 		allocID := alloc.ID
 
-		if auditErr := s.audit.Append(ctx, &domain.SettlementAuditEntry{
+		if auditErr := s.audit.Append(auditCtx, &domain.SettlementAuditEntry{
 			ID:           uuid.New(),
 			PlanID:       in.PlanID,
 			AllocationID: &allocID,
