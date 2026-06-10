@@ -6,6 +6,7 @@ import (
 
 	"github.com/CoverOnes/payment/internal/domain"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // TransactionStore defines persistence operations for transactions.
@@ -49,6 +50,11 @@ type SettlementPlanStore interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.SettlementPlan, error)
 	// UpdateStatus updates only the status and updated_at columns.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PlanStatus) error
+	// CompletePlanAtomic atomically transitions a plan from ACTIVE to COMPLETED using
+	// UPDATE ... WHERE id=$1 AND status='ACTIVE'. Returns ErrInvalidTransition when
+	// the plan exists but is not ACTIVE (concurrent completion already won the race).
+	// Returns ErrPlanNotFound when no row matches id at all.
+	CompletePlanAtomic(ctx context.Context, id uuid.UUID) error
 	// CountByMultiContractID returns the number of non-canceled plans for a contract.
 	CountByMultiContractID(ctx context.Context, multiContractID uuid.UUID) (int, error)
 	// GetByMultiContractID returns the active (non-canceled) settlement plan for a contract.
@@ -117,6 +123,9 @@ type SettlementMilestoneDisbursementStore interface {
 	ListByPlanMilestone(ctx context.Context, planID, milestoneID uuid.UUID) ([]*domain.SettlementMilestoneDisbursement, error)
 	// UpdateStatus updates the status, tx_id, and updated_at columns.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.MilestoneDisbursementStatus, txID *uuid.UUID) error
+	// SumDisbursedByPlanID returns the SUM(amount) of all rows WHERE plan_id=$1 AND status='DISBURSED'.
+	// Used by DisburseMilestone to enforce the per-plan cumulative cap against plan.TotalAmount (M-1).
+	SumDisbursedByPlanID(ctx context.Context, planID uuid.UUID) (decimal.Decimal, error)
 }
 
 // SettlementTxManager runs a function inside a single Postgres transaction, providing

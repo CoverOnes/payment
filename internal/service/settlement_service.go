@@ -76,6 +76,11 @@ type CreatePlanInput struct {
 	TenderID uuid.UUID
 	// Currency is the ISO 4217 settlement currency (e.g. "TWD").
 	Currency string
+	// TotalAmount is the contract total disbursement cap (M-1 fix).
+	// Must be set at plan creation so DisburseMilestone can enforce the cumulative cap.
+	// When the contract_activated event carries the total, pass it here; otherwise
+	// workspace MUST add totalAmount to the contract_activated event (cross-service follow-up).
+	TotalAmount decimal.Decimal
 	// IdempotencyKey scopes plan creation; use "contract_activated:<eventId>".
 	IdempotencyKey string
 }
@@ -148,7 +153,7 @@ func buildPlanWithAllocations(in *CreatePlanInput, roster []RosterEntry) (*domai
 		MultiContractID:  in.MultiContractID,
 		TenderID:         in.TenderID,
 		Status:           domain.PlanStatusActive,
-		TotalAmount:      decimal.Zero,
+		TotalAmount:      in.TotalAmount,
 		Currency:         in.Currency,
 		FrozenPartyCount: len(roster),
 		IdempotencyKey:   in.IdempotencyKey,
@@ -241,22 +246,24 @@ type DisburseMilestoneInput struct {
 }
 
 // VendorDisburseOutcome records the per-vendor result of a single DisburseMilestone call.
-// Callers use this to build an honest API response reflecting partial-failure scenarios.
+// In the all-or-nothing model all outcomes in a successful call are always DISBURSED.
 type VendorDisburseOutcome struct {
 	// VendorUserID identifies the vendor.
 	VendorUserID uuid.UUID `json:"vendorUserId"`
-	// Status is "DISBURSED" or "FAILED".
+	// Status is "DISBURSED" (or "FAILED" on legacy retried rows from before the model change).
 	Status string `json:"status"`
 }
 
 // DisburseResult is the structured outcome of DisburseMilestone.
-// It replaces the opaque bool-anyFailed that was previously internal-only.
+// Fix #3 (Critical): in the all-or-nothing model, FailedCount is always 0 on a
+// successful call — any vendor error rolls back the whole transaction and returns
+// an error from DisburseMilestone instead.
 type DisburseResult struct {
 	// Outcomes is one entry per vendor allocation, in allocation order.
 	Outcomes []VendorDisburseOutcome
 	// DisbursedCount is the number of vendors successfully disbursed (or idempotently skipped).
 	DisbursedCount int
-	// FailedCount is the number of vendors whose disbursement failed this call.
+	// FailedCount is always 0 in the all-or-nothing model; retained for API compat.
 	FailedCount int
 }
 
@@ -269,12 +276,15 @@ type DisburseResult struct {
 //  4. Idempotency: check settlement_milestone_disbursements for (plan, milestone, vendor);
 //     if already DISBURSED → genuine skip (return success WITHOUT re-creating).
 //  5. Create one settlement_milestone_disbursements row + one transactions row per vendor
-//     in the SAME transaction (atomicity — Critical fix).
-//  6. Partial-failure: a failed vendor gets status FAILED; others still disburse.
+//     in the SAME transaction (atomicity).
+//  6. Fix #3 (Critical): all-or-nothing model — any vendor DB error returns an error,
+//     rolling back the entire pgx transaction. The 207 partial-failure path has been
+//     removed because it was structurally unreachable in production (a real SQL error
+//     aborts the shared pgx tx, making "already-paid vendors" an illusion).
 //  7. Triple sum-check pre-tx and post-tx.
 //
 // Returns a *DisburseResult describing the per-vendor outcome so the caller can
-// render an honest HTTP response discriminant (200/207/502 + status field).
+// render an honest HTTP response (200 all-paid / error all-rolled-back).
 func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseMilestoneInput) (*DisburseResult, error) {
 	if err := validateDisburseMilestoneInput(in); err != nil {
 		return nil, err
@@ -296,12 +306,18 @@ func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseM
 	})
 
 	if txErr != nil {
+		// Fix #6 (Major): write ALLOCATION_FAILED audit entries for all vendors when the
+		// transaction rolls back. The rolled-back tx leaves no DB trace of the attempt,
+		// so these out-of-tx audit writes are the only DB record of the failure.
+		// Best-effort: audit failures are logged but not returned to the caller.
+		s.appendAllocationFailedAudit(ctx, in, txErr)
+
 		return nil, txErr
 	}
 
 	result := buildDisburseResult(outcomes)
 
-	if err := s.postDisburseCheck(in, disbursedAmounts, result.FailedCount > 0); err != nil {
+	if err := s.postDisburseCheck(in, disbursedAmounts); err != nil {
 		return nil, err
 	}
 
@@ -330,6 +346,30 @@ func (s *SettlementService) disburseMilestoneTx(
 		return fmt.Errorf("%w: plan is CANCELED", domain.ErrInvalidTransition)
 	}
 
+	// M-1 (Major): cumulative disbursement cap. Only enforced when plan.TotalAmount > 0
+	// (zero means cap was not set at creation — treated as uncapped, backwards-compatible).
+	if plan.TotalAmount.GreaterThan(decimal.Zero) {
+		sumDisbursed, sumErr := disbursements.SumDisbursedByPlanID(ctx, in.PlanID)
+		if sumErr != nil {
+			return fmt.Errorf("query cumulative disbursed sum: %w", sumErr)
+		}
+
+		if sumDisbursed.Add(in.Amount).GreaterThan(plan.TotalAmount) {
+			return fmt.Errorf("%w: cumulative disbursed %s + incoming %s exceeds plan total_amount %s",
+				domain.ErrValidation,
+				sumDisbursed.StringFixed(2),
+				in.Amount.StringFixed(2),
+				plan.TotalAmount.StringFixed(2))
+		}
+	}
+
+	// Fix #2 (Major): assert currency matches the frozen plan currency so that a
+	// forged/buggy event with a mismatched currency cannot corrupt accounting.
+	if in.Currency != plan.Currency {
+		return fmt.Errorf("%w: disburse currency %q does not match plan currency %q",
+			domain.ErrValidation, in.Currency, plan.Currency)
+	}
+
 	lockedAllocs, listErr := allocs.ListByPlanIDForUpdate(ctx, in.PlanID)
 	if listErr != nil {
 		return fmt.Errorf("lock allocations for plan: %w", listErr)
@@ -353,26 +393,26 @@ func (s *SettlementService) disburseMilestoneTx(
 	*disbursedAmounts = make([]decimal.Decimal, 0, len(lockedAllocs))
 	*outcomes = make([]VendorDisburseOutcome, 0, len(lockedAllocs))
 
+	// Fix #3 (Critical): all-or-nothing loop — any error propagates immediately,
+	// causing WithSettlementTx to roll back the entire pgx transaction.
 	for i, alloc := range lockedAllocs {
-		ok, disbursed := s.disburseAllocation(ctx, in, disbursements, txTxStore, audit, plan, alloc, amounts[i])
-		if ok {
-			*disbursedAmounts = append(*disbursedAmounts, disbursed)
-			*outcomes = append(*outcomes, VendorDisburseOutcome{
-				VendorUserID: alloc.VendorUserID,
-				Status:       string(domain.MilestoneDisbursementStatusDisbursed),
-			})
-		} else {
-			*outcomes = append(*outcomes, VendorDisburseOutcome{
-				VendorUserID: alloc.VendorUserID,
-				Status:       string(domain.MilestoneDisbursementStatusFailed),
-			})
+		disbursed, allocErr := s.disburseAllocation(ctx, in, disbursements, txTxStore, audit, plan, alloc, amounts[i])
+		if allocErr != nil {
+			return fmt.Errorf("disburse vendor %s: %w", alloc.VendorUserID, allocErr)
 		}
+
+		*disbursedAmounts = append(*disbursedAmounts, disbursed)
+		*outcomes = append(*outcomes, VendorDisburseOutcome{
+			VendorUserID: alloc.VendorUserID,
+			Status:       string(domain.MilestoneDisbursementStatusDisbursed),
+		})
 	}
 
 	return nil
 }
 
 // buildDisburseResult aggregates per-vendor outcomes into a DisburseResult summary.
+// In the all-or-nothing model all outcomes are always DISBURSED (or the call errored).
 func buildDisburseResult(outcomes []VendorDisburseOutcome) *DisburseResult {
 	r := &DisburseResult{Outcomes: outcomes}
 
@@ -388,7 +428,14 @@ func buildDisburseResult(outcomes []VendorDisburseOutcome) *DisburseResult {
 }
 
 // disburseAllocation disburses a single allocation using the per-milestone disbursement model.
-// Returns (true, amount) on success or idempotent skip, (false, zero) on failure.
+// Returns (amount, nil) on success or idempotent skip, or (zero, error) on failure.
+//
+// Fix #3 (Critical): the return type changed from (bool, decimal.Decimal) to
+// (decimal.Decimal, error). Errors now propagate to the caller (disburseMilestoneTx),
+// which returns them from within the pgx transaction, triggering an honest rollback.
+// The old pattern swallowed errors and used a bool flag to indicate failure, giving the
+// false impression that "some vendors paid, others failed" could persist atomically —
+// it cannot, because a real SQL error aborts the shared pgx transaction entirely.
 //
 // Idempotency: if (plan, milestone, vendor) already has a DISBURSED record → genuine skip.
 // Atomicity: the transactions row + the settlement_milestone_disbursements row are written
@@ -402,7 +449,7 @@ func (s *SettlementService) disburseAllocation(
 	plan *domain.SettlementPlan,
 	alloc *domain.SettlementAllocation,
 	allocAmt decimal.Decimal,
-) (bool, decimal.Decimal) {
+) (decimal.Decimal, error) {
 	// Content-addressed idempotency key: unique per (plan, milestone, vendor).
 	iKey := fmt.Sprintf("disburse:%s:%s:%s", in.PlanID, in.MilestoneID, alloc.VendorUserID)
 
@@ -426,31 +473,16 @@ func (s *SettlementService) disburseAllocation(
 
 	inserted, createErr := disbursements.Create(ctx, disburseRow)
 	if createErr != nil {
-		slog.Error("create milestone disbursement row failed; marking FAILED",
-			"plan_id", in.PlanID,
-			"milestone_id", in.MilestoneID,
-			"vendor_user_id", alloc.VendorUserID,
-			"err", createErr)
-
-		return false, decimal.Zero
+		return decimal.Zero, fmt.Errorf("create milestone disbursement row: %w", createErr)
 	}
 
 	if !inserted {
 		// Row already existed — fetch it and branch on its current status.
 		// DISBURSED: genuine idempotent skip — vendor was already paid; do NOT re-pay.
-		// FAILED: the prior transaction Create failed, so no transactions row exists.
-		//         Re-try now so that a re-trigger actually pays the previously-failed vendor.
-		// PENDING: defensive — a committed tx must have either succeeded or failed, so
-		//         PENDING persisted across a commit boundary is anomalous; retry like FAILED.
+		// PENDING: anomalous (a committed tx must have succeeded or failed); treat as retryable.
 		existing, fetchErr := disbursements.GetByPlanMilestoneVendor(ctx, in.PlanID, in.MilestoneID, alloc.VendorUserID)
 		if fetchErr != nil {
-			slog.Error("fetch existing disbursement failed",
-				"plan_id", in.PlanID,
-				"milestone_id", in.MilestoneID,
-				"vendor_user_id", alloc.VendorUserID,
-				"err", fetchErr)
-
-			return false, decimal.Zero
+			return decimal.Zero, fmt.Errorf("fetch existing disbursement: %w", fetchErr)
 		}
 
 		if existing.Status == domain.MilestoneDisbursementStatusDisbursed {
@@ -460,13 +492,11 @@ func (s *SettlementService) disburseAllocation(
 				"milestone_id", in.MilestoneID,
 				"vendor_user_id", alloc.VendorUserID)
 
-			return true, existing.Amount
+			return existing.Amount, nil
 		}
 
-		// FAILED or PENDING: attempt to pay now. The prior transactions.Create failed
-		// (status FAILED) or is anomalously stale (status PENDING), so no tx row exists —
-		// safe to create one without risking a duplicate transaction.
-		slog.Info("per-milestone disbursement is retryable; attempting re-pay",
+		// PENDING (anomalous stale row): attempt to pay now.
+		slog.Info("per-milestone disbursement is stale PENDING; attempting pay",
 			"plan_id", in.PlanID,
 			"milestone_id", in.MilestoneID,
 			"vendor_user_id", alloc.VendorUserID,
@@ -475,7 +505,7 @@ func (s *SettlementService) disburseAllocation(
 		disburseRow = existing // use the existing row's ID for UpdateStatus calls below
 	}
 
-	// Self-transfer guard (Critical fix): PayerUserID = platform system account,
+	// Self-transfer guard: PayerUserID = platform system account,
 	// PayeeUserID = vendor. This ensures payer != payee always.
 	txRow := &domain.Transaction{
 		ID:             uuid.New(),
@@ -498,33 +528,18 @@ func (s *SettlementService) disburseAllocation(
 	// In the single-tx model, the disbursement row and transaction row are written in the
 	// same DB transaction. If txTxStore.Create were to return ErrDuplicateKey, it would
 	// mean a transaction with the same idempotency_key already exists — but since we only
-	// reach this point on a fresh INSERT (inserted=true) or a FAILED/PENDING retry (where
-	// the prior tx Create failed and no tx row exists), a duplicate is structurally
-	// impossible. Silently "marking DISBURSED" on an unreachable branch would create a
-	// misleading audit trail. If this assumption ever breaks, the ErrDuplicateKey will
-	// surface as a real error and be caught by the generic error handler below.
-	if createErr := txTxStore.Create(ctx, txRow); createErr != nil {
-		slog.Error("create transaction row failed; marking disbursement FAILED",
-			"plan_id", in.PlanID,
-			"milestone_id", in.MilestoneID,
-			"vendor_user_id", alloc.VendorUserID,
-			"err", createErr)
-
-		if updErr := disbursements.UpdateStatus(ctx, disburseRow.ID, domain.MilestoneDisbursementStatusFailed, nil); updErr != nil {
-			slog.Error("failed to mark disbursement FAILED", "disbursement_id", disburseRow.ID, "err", updErr)
-		}
-
-		return false, decimal.Zero
+	// reach this point on a fresh INSERT (inserted=true) or a PENDING retry (where
+	// no tx row exists), a duplicate is structurally impossible. If this assumption
+	// ever breaks, the ErrDuplicateKey will surface as a real error and roll back correctly.
+	if createErr = txTxStore.Create(ctx, txRow); createErr != nil {
+		return decimal.Zero, fmt.Errorf("create transaction row: %w", createErr)
 	}
 
 	txID := txRow.ID
 
 	// Update disbursement record to DISBURSED with the tx_id.
 	if updErr := disbursements.UpdateStatus(ctx, disburseRow.ID, domain.MilestoneDisbursementStatusDisbursed, &txID); updErr != nil {
-		slog.Error("update disbursement to DISBURSED failed",
-			"disbursement_id", disburseRow.ID, "err", updErr)
-
-		return false, decimal.Zero
+		return decimal.Zero, fmt.Errorf("update disbursement to DISBURSED: %w", updErr)
 	}
 
 	payload, _ := json.Marshal(map[string]any{
@@ -547,16 +562,15 @@ func (s *SettlementService) disburseAllocation(
 		slog.Error("append allocation_disbursed audit failed", "allocation_id", alloc.ID, "err", auditErr)
 	}
 
-	return true, allocAmt
+	return allocAmt, nil
 }
 
 // postDisburseCheck runs post-tx sum verification and logs final outcome.
 func (s *SettlementService) postDisburseCheck(
 	in *DisburseMilestoneInput,
 	disbursedAmounts []decimal.Decimal,
-	anyFailed bool,
 ) error {
-	if !anyFailed && len(disbursedAmounts) > 0 {
+	if len(disbursedAmounts) > 0 {
 		if err := verifySumEquals(disbursedAmounts, in.Amount, "post-disburse"); err != nil {
 			slog.Error("POST-DISBURSE SUM INVARIANT VIOLATED — possible money-drift",
 				"plan_id", in.PlanID,
@@ -567,16 +581,116 @@ func (s *SettlementService) postDisburseCheck(
 		}
 	}
 
-	if anyFailed {
-		slog.Warn("milestone disburse completed with partial failures; plan remains ACTIVE for re-trigger",
-			"plan_id", in.PlanID,
-			"milestone_id", in.MilestoneID)
-	} else {
-		slog.Info("milestone disburse completed successfully",
+	slog.Info("milestone disburse completed successfully",
+		"plan_id", in.PlanID,
+		"milestone_id", in.MilestoneID,
+		"amount", in.Amount.StringFixed(2))
+
+	return nil
+}
+
+// appendAllocationFailedAudit writes an ALLOCATION_FAILED audit entry for each vendor
+// allocation after a disburse transaction rolls back.
+// Fix #6 (Major): these out-of-tx writes are the only DB record of a failed disburse attempt.
+// M-2 (Major): uses an independent context.WithTimeout(context.Background(), 10*time.Second)
+// so the audit write is not silently dropped when the caller ctx is already canceled or timed out.
+// Best-effort: fetching allocations or individual audit writes may fail (e.g., DB unavailable
+// during the same outage that caused the tx failure); each error is logged but not propagated.
+//
+//nolint:contextcheck // intentional: independent context so failure-audit survives caller ctx cancellation (M-2)
+func (s *SettlementService) appendAllocationFailedAudit(_ context.Context, in *DisburseMilestoneInput, txErr error) {
+	auditCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	allocs, listErr := s.allocs.ListByPlanID(auditCtx, in.PlanID)
+	if listErr != nil {
+		slog.Error("appendAllocationFailedAudit: cannot list allocations for audit",
 			"plan_id", in.PlanID,
 			"milestone_id", in.MilestoneID,
-			"amount", in.Amount.StringFixed(2))
+			"err", listErr)
+
+		return
 	}
+
+	for _, alloc := range allocs {
+		// M-4: store only error type/class, not raw error string (which may contain SQL internals).
+		payload, _ := json.Marshal(map[string]any{
+			"milestone_id":   in.MilestoneID,
+			"vendor_user_id": alloc.VendorUserID,
+			"reason":         fmt.Sprintf("tx_error:%T", txErr),
+		})
+
+		allocID := alloc.ID
+
+		if auditErr := s.audit.Append(auditCtx, &domain.SettlementAuditEntry{
+			ID:           uuid.New(),
+			PlanID:       in.PlanID,
+			AllocationID: &allocID,
+			EventType:    "ALLOCATION_FAILED",
+			ActorService: in.ActorService,
+			Payload:      payload,
+			OccurredAt:   time.Now().UTC(),
+		}); auditErr != nil {
+			slog.Error("appendAllocationFailedAudit: failed to write audit entry",
+				"plan_id", in.PlanID,
+				"allocation_id", alloc.ID,
+				"err", auditErr)
+		}
+	}
+}
+
+// CompletePlan transitions a plan from ACTIVE to COMPLETED and writes a PLAN_COMPLETED audit entry.
+// Fix #6 (Major): implements the plan-completion transition that was missing (plans stayed ACTIVE
+// forever, never reaching PlanStatusCompleted).
+//
+// Callers: the workspace service should invoke this (via the manual disburse endpoint or a
+// dedicated "plan complete" endpoint) after confirming all milestones have been disbursed.
+// Returns ErrPlanNotFound if the plan does not exist.
+// Returns ErrInvalidTransition if the plan is not ACTIVE (already COMPLETED or CANCELED).
+// CompletePlan transitions a plan from ACTIVE to COMPLETED and writes a PLAN_COMPLETED audit entry.
+// Fix #6 (Major): implements the plan-completion transition that was missing (plans stayed ACTIVE
+// forever, never reaching PlanStatusCompleted).
+// TOCTOU fix: uses CompletePlanAtomic (UPDATE ... WHERE id=$1 AND status='ACTIVE') so that two
+// concurrent calls cannot both observe ACTIVE and both write a PLAN_COMPLETED audit entry —
+// exactly one wins the race (RowsAffected == 1); the other receives ErrInvalidTransition.
+//
+// Callers: the workspace service should invoke this (via the manual disburse endpoint or a
+// dedicated "plan complete" endpoint) after confirming all milestones have been disbursed.
+// Returns ErrPlanNotFound if the plan does not exist.
+// Returns ErrInvalidTransition if the plan is not ACTIVE (already COMPLETED or CANCELED).
+func (s *SettlementService) CompletePlan(ctx context.Context, planID uuid.UUID) error {
+	// Fetch the plan first so we have multi_contract_id for the audit payload.
+	// This read is non-locking; the atomic transition below races correctly via the DB guard.
+	plan, err := s.plans.GetByID(ctx, planID)
+	if err != nil {
+		return err
+	}
+
+	// Atomic ACTIVE → COMPLETED transition: UPDATE ... WHERE id=$1 AND status='ACTIVE'.
+	// If two concurrent calls both pass the GetByID check above, only one will update a row;
+	// the other sees RowsAffected == 0 and receives ErrInvalidTransition from the store.
+	if atomicErr := s.plans.CompletePlanAtomic(ctx, planID); atomicErr != nil {
+		return atomicErr
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"multi_contract_id": plan.MultiContractID,
+	})
+
+	if auditErr := s.audit.Append(ctx, &domain.SettlementAuditEntry{
+		ID:           uuid.New(),
+		PlanID:       planID,
+		EventType:    "PLAN_COMPLETED",
+		ActorService: "payment",
+		Payload:      payload,
+		OccurredAt:   time.Now().UTC(),
+	}); auditErr != nil {
+		slog.Error("CompletePlan: failed to write PLAN_COMPLETED audit entry",
+			"plan_id", planID,
+			"err", auditErr)
+	}
+
+	slog.Info("settlement plan completed", "plan_id", planID)
 
 	return nil
 }
@@ -637,8 +751,20 @@ func validateDisburseMilestoneInput(in *DisburseMilestoneInput) error {
 		return fmt.Errorf("%w: amount must be positive", domain.ErrValidation)
 	}
 
+	// Fix #1 (Major): mirror the create-path max-amount cap so that an untrusted
+	// Redis event cannot drive unbounded money movement.
+	if in.Amount.GreaterThan(maxAmount) {
+		return fmt.Errorf("%w: amount must not exceed 100000000.00", domain.ErrValidation)
+	}
+
 	if in.Currency == "" {
 		return fmt.Errorf("%w: currency is required", domain.ErrValidation)
+	}
+
+	// Fix #2 (Major): reject currencies not in the explicit allowlist — mirrors the
+	// create-path check and prevents cross-currency disbursal from a forged Redis event.
+	if !allowedCurrencies[in.Currency] {
+		return fmt.Errorf("%w: currency must be one of TWD, USD, EUR", domain.ErrValidation)
 	}
 
 	return nil

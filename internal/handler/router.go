@@ -105,6 +105,14 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 			middleware.RequireServiceIdentity(cfg.SettlementS2SToken),
 			settlementH.Disburse,
 		)
+		// CompletePlan wiring: workspace calls this after all milestones have been disbursed.
+		// Uses the same auth gates as /disburse (gateway signature + valid identity + tier 3 + S2S token).
+		settlement.POST(
+			"/plans/:id/complete",
+			middleware.RequireTier(3),
+			middleware.RequireServiceIdentity(cfg.SettlementS2SToken),
+			settlementH.CompletePlan,
+		)
 	}
 
 	return r

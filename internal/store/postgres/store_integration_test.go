@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -26,10 +27,13 @@ type (
 	storeAuditStore       = store.AuditStore
 )
 
-// startTestDB spins up a real Postgres container via testcontainers.
-func startTestDB(t *testing.T) string {
-	t.Helper()
+// ─── TestMain singleton container ────────────────────────────────────────────
+// One container + one migration run for the entire package.
+// Each test uses the shared DSN; isolation is achieved via unique UUIDs per test.
 
+var sharedDSN string
+
+func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	ctr, err := tcpostgres.Run(
@@ -40,26 +44,37 @@ func startTestDB(t *testing.T) string {
 		tcpostgres.WithPassword("testpass"),
 		tcpostgres.BasicWaitStrategies(),
 	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: start postgres: %v\n", err)
+		os.Exit(1)
+	}
 
 	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: connection string: %v\n", err)
+		_ = ctr.Terminate(ctx)
+		os.Exit(1)
+	}
 
-	return dsn
+	if err := applyMigrations(ctx, dsn); err != nil {
+		fmt.Fprintf(os.Stderr, "testcontainers: migrate: %v\n", err)
+		_ = ctr.Terminate(ctx)
+		os.Exit(1)
+	}
+
+	sharedDSN = dsn
+	code := m.Run()
+
+	_ = ctr.Terminate(ctx)
+	os.Exit(code)
 }
 
-// runMigrations applies embedded *.up.sql files against the test DB.
-func runMigrations(t *testing.T, ctx context.Context, dsn string) {
-	t.Helper()
-
+// applyMigrations runs all embedded *.up.sql files against dsn. Used by TestMain only.
+func applyMigrations(ctx context.Context, dsn string) error {
 	pool, err := postgres.NewPool(ctx, dsn)
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("new pool: %w", err)
+	}
 
 	defer pool.Close()
 
@@ -76,19 +91,45 @@ func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 
 		return nil
 	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+	if err != nil {
+		return fmt.Errorf("walk migrations FS: %w", err)
+	}
+
+	if len(upFiles) == 0 {
+		return fmt.Errorf("no *.up.sql files found in embedded FS")
+	}
 
 	sort.Strings(upFiles)
 
 	for _, file := range upFiles {
 		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
+		if readErr != nil {
+			return fmt.Errorf("read migration %s: %w", file, readErr)
+		}
 
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, fmt.Sprintf("apply migration %s", file))
+		if _, execErr := pool.Exec(ctx, string(data)); execErr != nil {
+			return fmt.Errorf("apply migration %s: %w", file, execErr)
+		}
 	}
+
+	return nil
 }
+
+// ─── Test helpers ────────────────────────────────────────────────────────────
+
+// startTestDB returns the shared DSN. Skips in short mode.
+func startTestDB(t *testing.T) string {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	return sharedDSN
+}
+
+// runMigrations is a no-op: migrations are applied once in TestMain.
+func runMigrations(_ *testing.T, _ context.Context, _ string) {}
 
 // newTestTransaction returns a valid Transaction for testing.
 func newTestTransaction(payer, payee uuid.UUID, key string) *domain.Transaction {

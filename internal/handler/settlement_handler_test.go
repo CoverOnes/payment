@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -187,6 +188,10 @@ func (s *stubDisburser) DisburseMilestone(
 	return s.result, s.err
 }
 
+func (s *stubDisburser) CompletePlan(_ context.Context, _ uuid.UUID) error {
+	return s.err
+}
+
 // buildStubRouter wires a Gin engine with the given stub disburser so that
 // handler-level tests can control the DisburseMilestone outcome without a DB.
 func buildStubRouter(stub handler.SettlementDisburser) http.Handler {
@@ -198,8 +203,24 @@ func buildStubRouter(stub handler.SettlementDisburser) http.Handler {
 	// Mirror the router group structure from NewRouter — identity + service token guards.
 	grp := r.Group("/v1/settlement")
 	grp.POST("/plans/:id/disburse", h.Disburse)
+	grp.POST("/plans/:id/complete", h.CompletePlan)
 
 	return r
+}
+
+// completePlanReq builds a POST /v1/settlement/plans/:id/complete request.
+func completePlanReq(t *testing.T, planID string) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+planID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	return req
 }
 
 // disburseBodyWithKey builds a disburse request body with the given idempotency key.
@@ -265,67 +286,28 @@ func TestSettlementHandler_Disburse_AllSuccess(t *testing.T) {
 	assert.Equal(t, "disbursed", data["status"], "all-success status must be 'disbursed'")
 }
 
-// TestSettlementHandler_Disburse_PartialFailure verifies that when some vendors fail
-// the response is 207 Multi-Status with status "partial_failure" and per-vendor outcomes.
-func TestSettlementHandler_Disburse_PartialFailure(t *testing.T) {
-	vendor1 := uuid.New()
-	vendor2 := uuid.New()
-
+// TestSettlementHandler_Disburse_ServiceError_ReturnsError verifies that when the
+// service returns an error (e.g. DB failure rolling back the whole tx in the
+// all-or-nothing model), the handler propagates it as a non-200 response —
+// not a 207/502 partial-failure pseudo-success.
+// Fix #3 (Critical): the 207 partial_failure and 502 paths have been removed because
+// they were unreachable in production. Any vendor failure rolls back the whole tx.
+func TestSettlementHandler_Disburse_AllFailed_Error(t *testing.T) {
 	stub := &stubDisburser{
-		result: &service.DisburseResult{
-			DisbursedCount: 1,
-			FailedCount:    1,
-			Outcomes: []service.VendorDisburseOutcome{
-				{VendorUserID: vendor1, Status: "DISBURSED"},
-				{VendorUserID: vendor2, Status: "FAILED"},
-			},
-		},
+		err: fmt.Errorf("disburse vendor %s: %w", uuid.New(), errors.New("DB connection lost")),
 	}
 
 	r := buildStubRouter(stub)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, disburseReq(t, disburseBody(t)))
 
-	require.Equal(t, http.StatusMultiStatus, w.Code, "partial failure must return 207")
+	// In the all-or-nothing model, any vendor failure returns an error → not 200.
+	require.NotEqual(t, http.StatusOK, w.Code, "vendor failure must not return 200")
+	require.NotEqual(t, http.StatusMultiStatus, w.Code, "207 partial_failure path has been removed (fix #3)")
+	require.NotEqual(t, http.StatusBadGateway, w.Code, "502 all-failed path has been removed (fix #3)")
 
-	var resp map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	data := resp["data"].(map[string]any)
-	assert.Equal(t, "partial_failure", data["status"], "partial failure status must be 'partial_failure'")
-
-	vendors, ok := data["vendors"].([]any)
-	require.True(t, ok, "vendors must be a list")
-	assert.Len(t, vendors, 2, "must include per-vendor outcome for both vendors")
-}
-
-// TestSettlementHandler_Disburse_AllFailed verifies that when ALL vendors fail
-// the response is 502 with status "failed" — NOT 200 disbursed.
-func TestSettlementHandler_Disburse_AllFailed(t *testing.T) {
-	vendor1 := uuid.New()
-	vendor2 := uuid.New()
-
-	stub := &stubDisburser{
-		result: &service.DisburseResult{
-			DisbursedCount: 0,
-			FailedCount:    2,
-			Outcomes: []service.VendorDisburseOutcome{
-				{VendorUserID: vendor1, Status: "FAILED"},
-				{VendorUserID: vendor2, Status: "FAILED"},
-			},
-		},
-	}
-
-	r := buildStubRouter(stub)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, disburseReq(t, disburseBody(t)))
-
-	require.Equal(t, http.StatusBadGateway, w.Code, "all-failed must return 502, not 200")
-
-	var resp map[string]any
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	data := resp["data"].(map[string]any)
-	assert.Equal(t, "failed", data["status"], "all-failed status must be 'failed'")
-	assert.NotEqual(t, "disbursed", data["status"], "all-failed must NOT report 'disbursed'")
+	// The error is returned as an internal error (500 — unhandled domain error wrapping).
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "all-vendor rollback must return 500")
 }
 
 // TestSettlementHandler_Disburse_ServiceError verifies that a service error
@@ -418,30 +400,150 @@ func TestSettlementHandler_Disburse_IdempotencyKey_TooLong(t *testing.T) {
 	assert.Equal(t, "VALIDATION_ERROR", errBody["code"])
 }
 
-// ─── Fix 1 integration: DisburseResult fields from service ───────────────────
+// ─── DisburseResult struct contract ──────────────────────────────────────────
 
-// TestDisburseResult_Fields verifies the DisburseResult struct fields so callers
-// can rely on DisbursedCount + FailedCount + Outcomes as a stable API contract.
+// TestDisburseResult_Fields verifies the DisburseResult struct fields.
+// Fix #3 (Critical): in the all-or-nothing model, FailedCount is always 0
+// on a successful call. Any vendor failure rolls back the tx and returns error.
 func TestDisburseResult_Fields(t *testing.T) {
 	vendor1 := uuid.New()
 	vendor2 := uuid.New()
 
+	// Successful all-or-nothing call: both vendors disbursed, FailedCount == 0.
 	result := &service.DisburseResult{
-		DisbursedCount: 1,
-		FailedCount:    1,
+		DisbursedCount: 2,
+		FailedCount:    0, // always 0 in all-or-nothing model
 		Outcomes: []service.VendorDisburseOutcome{
 			{VendorUserID: vendor1, Status: "DISBURSED"},
-			{VendorUserID: vendor2, Status: "FAILED"},
+			{VendorUserID: vendor2, Status: "DISBURSED"},
 		},
 	}
 
-	assert.Equal(t, 1, result.DisbursedCount)
-	assert.Equal(t, 1, result.FailedCount)
+	assert.Equal(t, 2, result.DisbursedCount)
+	assert.Equal(t, 0, result.FailedCount, "FailedCount must be 0 in all-or-nothing model on success")
 	require.Len(t, result.Outcomes, 2)
 	assert.Equal(t, vendor1, result.Outcomes[0].VendorUserID)
 	assert.Equal(t, "DISBURSED", result.Outcomes[0].Status)
 	assert.Equal(t, vendor2, result.Outcomes[1].VendorUserID)
-	assert.Equal(t, "FAILED", result.Outcomes[1].Status)
+	assert.Equal(t, "DISBURSED", result.Outcomes[1].Status)
+}
+
+// ─── CompletePlan handler tests ──────────────────────────────────────────────
+
+// TestSettlementHandler_CompletePlan_MissingServiceToken verifies that a request
+// without X-Service-Token (missing service identity) returns 401.
+// Uses the full test router (buildTestRouter) which enforces RequireServiceIdentity.
+func TestSettlementHandler_CompletePlan_MissingServiceToken(t *testing.T) {
+	r := buildTestRouter()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+testPlanID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Id", "00000000-0000-0000-0000-000000000003")
+	req.Header.Set("X-Kyc-Tier", "3")
+	// X-Service-Token intentionally omitted.
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "missing service token must return 401")
+}
+
+// TestSettlementHandler_CompletePlan_WrongServiceToken verifies that an incorrect
+// X-Service-Token returns 401.
+func TestSettlementHandler_CompletePlan_WrongServiceToken(t *testing.T) {
+	r := buildTestRouter()
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/settlement/plans/"+testPlanID+"/complete",
+		http.NoBody,
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Id", "00000000-0000-0000-0000-000000000003")
+	req.Header.Set("X-Kyc-Tier", "3")
+	req.Header.Set("X-Service-Id", "workspace")
+	req.Header.Set("X-Service-Token", "wrong-token-that-does-not-match")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "wrong service token must return 401")
+}
+
+// TestSettlementHandler_CompletePlan_InvalidPlanID verifies that a non-UUID plan id
+// is rejected with 400 before the service is called.
+func TestSettlementHandler_CompletePlan_InvalidPlanID(t *testing.T) {
+	stub := &stubDisburser{}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, "not-a-valid-uuid"))
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "VALIDATION_ERROR", errBody["code"])
+}
+
+// TestSettlementHandler_CompletePlan_Success verifies that when CompletePlan succeeds
+// the response is 200 with status "completed".
+func TestSettlementHandler_CompletePlan_Success(t *testing.T) {
+	stub := &stubDisburser{err: nil}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	data, _ := resp["data"].(map[string]any)
+	assert.Equal(t, "completed", data["status"])
+	assert.Equal(t, testPlanID, data["planId"])
+}
+
+// TestSettlementHandler_CompletePlan_PlanNotFound verifies that ErrPlanNotFound
+// is surfaced as a 404 response (Fix 2: errors.go maps ErrPlanNotFound → 404).
+func TestSettlementHandler_CompletePlan_PlanNotFound(t *testing.T) {
+	stub := &stubDisburser{err: domain.ErrPlanNotFound}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusNotFound, w.Code, "ErrPlanNotFound must return 404")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "PLAN_NOT_FOUND", errBody["code"])
+}
+
+// TestSettlementHandler_CompletePlan_InvalidTransition verifies that ErrInvalidTransition
+// (plan not ACTIVE — e.g. concurrent completion won the race) returns 422 Unprocessable Entity.
+// ErrInvalidTransition → HTTP 422 is the existing domain mapping in errors.go
+// (StatusUnprocessableEntity = "invalid state transition"); 422 is the correct semantic
+// for a pre-condition failure (plan is not in the expected state).
+func TestSettlementHandler_CompletePlan_InvalidTransition(t *testing.T) {
+	stub := &stubDisburser{
+		err: fmt.Errorf("%w: plan is COMPLETED, cannot transition to COMPLETED", domain.ErrInvalidTransition),
+	}
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, completePlanReq(t, testPlanID))
+
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, "ErrInvalidTransition must return 422")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody, _ := resp["error"].(map[string]any)
+	assert.Equal(t, "INVALID_TRANSITION", errBody["code"])
 }
 
 // Compile-time check: ensure errors sentinel package is used (imported above for ServiceError test).
