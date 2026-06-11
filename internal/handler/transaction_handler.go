@@ -238,7 +238,7 @@ type transactionResponse struct {
 	Amount         string        `json:"amount"` // decimal string — never float
 	Currency       string        `json:"currency"`
 	Status         domain.Status `json:"status"`
-	IdempotencyKey string        `json:"idempotencyKey"`
+	IdempotencyKey string        `json:"-"`         // not exposed in API responses — internal idempotency key
 	CreatedAt      string        `json:"createdAt"` // RFC3339
 	UpdatedAt      string        `json:"updatedAt"` // RFC3339
 }

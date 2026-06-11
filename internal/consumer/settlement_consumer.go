@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CoverOnes/payment/internal/domain"
 	"github.com/CoverOnes/payment/internal/service"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -52,17 +53,31 @@ type contractCompletedEvent struct {
 	Data       contractCompletedData `json:"data"`
 }
 
+// settlementServicer is the minimal interface that SettlementConsumer needs from
+// SettlementService. Declared here so handler tests can inject a stub without a DB.
+type settlementServicer interface {
+	CreatePlan(ctx context.Context, in *service.CreatePlanInput) (*domain.SettlementPlan, error)
+	GetPlanByContractID(ctx context.Context, contractID uuid.UUID) (*domain.SettlementPlan, error)
+	DisburseMilestone(ctx context.Context, in *service.DisburseMilestoneInput) (*service.DisburseResult, error)
+}
+
 // SettlementConsumer subscribes to workspace Redis channels and drives the
 // SettlementService: contract_activated → CreatePlan, contract_completed → DisburseMilestone.
 // It is best-effort and idempotent: events may replay without side effects.
 type SettlementConsumer struct {
 	rdb *redis.Client
-	svc *service.SettlementService
+	svc settlementServicer
 }
 
 // NewSettlementConsumer returns a SettlementConsumer.
 func NewSettlementConsumer(rdb *redis.Client, svc *service.SettlementService) *SettlementConsumer {
 	return &SettlementConsumer{rdb: rdb, svc: svc}
+}
+
+// newSettlementConsumerWithService returns a SettlementConsumer with an injected service stub.
+// For use in tests only — production callers use NewSettlementConsumer.
+func newSettlementConsumerWithService(svc settlementServicer) *SettlementConsumer {
+	return &SettlementConsumer{svc: svc}
 }
 
 // Start subscribes to workspace channels and processes events until ctx is canceled.
@@ -160,7 +175,9 @@ func (c *SettlementConsumer) handleContractActivated(_ context.Context, payload 
 		IdempotencyKey:  iKey,
 	})
 	if err != nil {
-		slog.Error("settlement consumer: CreatePlan failed",
+		// WARNING: Redis pub/sub has NO retry mechanism — this event is permanently lost.
+		// Manual recovery is required via: POST /internal/v1/settlements/plans (re-create plan).
+		slog.Error("settlement consumer: CreatePlan failed — event permanently lost (pub/sub has no retry); manual recovery required",
 			"event_id", evt.EventID,
 			"contract_id", evt.Data.ContractID,
 			"err", err)
@@ -233,10 +250,13 @@ func (c *SettlementConsumer) handleContractCompleted(_ context.Context, payload 
 		ActorService: "payment-consumer",
 	})
 	if err != nil {
-		slog.Error("settlement consumer: DisburseMilestone failed; event will be retried",
+		// WARNING: Redis pub/sub has NO retry mechanism — this event is permanently lost.
+		// Manual recovery: POST /internal/v1/settlements/milestones/disburse
+		slog.Error("settlement consumer: DisburseMilestone failed — permanently lost (pub/sub no retry); manual recovery required",
 			"event_id", evt.EventID,
 			"plan_id", plan.ID,
 			"milestone_id", evt.Data.MilestoneID,
+			"recovery_endpoint", "POST /internal/v1/settlements/milestones/disburse",
 			"err", err)
 
 		return

@@ -1741,3 +1741,231 @@ func TestSettlementService_DisburseMilestone_CumulativeCap(t *testing.T) {
 	require.Error(t, err, "any amount past the cap must be rejected")
 	require.ErrorIs(t, err, domain.ErrValidation, "over-cap must return ErrValidation")
 }
+
+// ─── Fix #1 (re-review): ACTIVE-only guard on disburseMilestoneTx ────────────
+//
+// TestSettlementService_DisburseMilestone_CompletedPlanRejected verifies that
+// DisburseMilestone on a COMPLETED plan returns ErrInvalidTransition and does not
+// write any new disbursement rows. This pins the "ACTIVE-only" guard introduced to
+// fix the finding that a completed plan was still disbursable with fresh milestoneIDs.
+func TestSettlementService_DisburseMilestone_CompletedPlanRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	// Create and activate a plan (CreatePlan returns ACTIVE).
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	assert.Equal(t, domain.PlanStatusActive, plan.Status, "plan must start ACTIVE")
+
+	// Disburse the first milestone while ACTIVE — must succeed.
+	milestone1 := uuid.New()
+	amount, _ := decimal.NewFromString("1000.00")
+
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone1,
+		Amount:       amount,
+		Currency:     "TWD",
+		ActorService: "test",
+	})
+	require.NoError(t, err, "disburse on ACTIVE plan must succeed")
+
+	// Transition the plan to COMPLETED.
+	require.NoError(t, svc.CompletePlan(ctx, plan.ID), "CompletePlan must succeed on ACTIVE plan")
+
+	// Confirm the plan is now COMPLETED.
+	completedPlan, err := svc.GetPlan(ctx, plan.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.PlanStatusCompleted, completedPlan.Status, "plan must be COMPLETED")
+
+	// Attempt to disburse a FRESH milestoneID on the COMPLETED plan — must fail.
+	milestone2 := uuid.New()
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestone2,
+		Amount:       amount,
+		Currency:     "TWD",
+		ActorService: "test",
+	})
+	require.Error(t, err, "DisburseMilestone on COMPLETED plan must return error")
+	require.ErrorIs(t, err, domain.ErrInvalidTransition,
+		"COMPLETED plan must return ErrInvalidTransition; got: %v", err)
+
+	// Verify zero new disbursement rows were created for the fresh milestone.
+	d2, listErr := svc.GetMilestoneDisbursements(ctx, plan.ID, milestone2)
+	require.NoError(t, listErr)
+	assert.Empty(t, d2, "no disbursement rows must exist for the rejected milestone on COMPLETED plan")
+}
+
+// TestSettlementService_DisburseMilestone_CanceledPlanRejected verifies that
+// DisburseMilestone on a CANCELED plan also returns ErrInvalidTransition.
+// Complements CompletedPlanRejected — the ACTIVE-only guard covers both non-ACTIVE states.
+func TestSettlementService_DisburseMilestone_CanceledPlanRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	)
+
+	pool, err := postgres.NewPool(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	// Directly cancel the plan via the store (bypassing service — there is no CancelPlan API).
+	planStore := postgres.NewSettlementPlanStore(pool)
+	require.NoError(
+		t,
+		planStore.UpdateStatus(ctx, plan.ID, domain.PlanStatusCanceled),
+		"direct cancel via store must succeed",
+	)
+
+	milestoneID := uuid.New()
+	amount, _ := decimal.NewFromString("500.00")
+
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  milestoneID,
+		Amount:       amount,
+		Currency:     "TWD",
+		ActorService: "test",
+	})
+	require.Error(t, err, "DisburseMilestone on CANCELED plan must return error")
+	require.ErrorIs(t, err, domain.ErrInvalidTransition,
+		"CANCELED plan must return ErrInvalidTransition; got: %v", err)
+}
+
+// ─── Fix #7 (re-review): concurrent cap regression ───────────────────────────
+//
+// TestSettlementService_DisburseMilestone_ConcurrentCapEnforcement verifies that
+// two concurrent DisburseMilestone calls with amounts that individually pass but
+// together exceed TotalAmount result in exactly one succeeding and the total
+// disbursed staying <= TotalAmount. The plan-row FOR UPDATE lock serializes the
+// cap check so both calls cannot race past it simultaneously.
+func TestSettlementService_DisburseMilestone_ConcurrentCapEnforcement(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+	// Single-vendor plan to keep concurrent disbursement counts simple.
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	// TotalAmount = 3000. Two concurrent calls each with 2000 — individually within cap
+	// (2000 < 3000), but together they sum to 4000 > 3000.
+	totalAmount, _ := decimal.NewFromString("3000.00")
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		TotalAmount:     totalAmount,
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must be set")
+
+	callAmount, _ := decimal.NewFromString("2000.00") // 2000 < 3000 → individually passes cap
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	milestones := [2]uuid.UUID{uuid.New(), uuid.New()} // two DISTINCT milestoneIDs
+
+	for i := range 2 {
+		wg.Add(1)
+
+		go func(idx int) {
+			defer wg.Done()
+
+			_, errs[idx] = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+				PlanID:       plan.ID,
+				MilestoneID:  milestones[idx],
+				Amount:       callAmount,
+				Currency:     "TWD",
+				ActorService: "test-concurrent-cap",
+			})
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Exactly one must succeed and one must fail with ErrValidation (cap exceeded).
+	successes := 0
+	capErrors := 0
+
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			successes++
+		case errors.Is(e, domain.ErrValidation):
+			capErrors++
+		default:
+			t.Errorf("unexpected error type: %v", e)
+		}
+	}
+
+	assert.Equal(t, 1, successes, "exactly one concurrent call must succeed")
+	assert.Equal(t, 1, capErrors, "exactly one concurrent call must be rejected by cap (ErrValidation)")
+
+	// Verify total disbursed <= TotalAmount.
+	var totalDisbursed decimal.Decimal
+
+	for _, m := range milestones {
+		rows, listErr := svc.GetMilestoneDisbursements(ctx, plan.ID, m)
+		require.NoError(t, listErr)
+
+		for _, r := range rows {
+			if r.Status == domain.MilestoneDisbursementStatusDisbursed {
+				totalDisbursed = totalDisbursed.Add(r.Amount)
+			}
+		}
+	}
+
+	assert.True(t, totalDisbursed.LessThanOrEqual(totalAmount),
+		"total disbursed %s must not exceed TotalAmount %s",
+		totalDisbursed.StringFixed(2), totalAmount.StringFixed(2))
+}
