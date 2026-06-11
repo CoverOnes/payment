@@ -181,6 +181,7 @@ SELECT id, payer_user_id, payee_user_id, contract_id, milestone_id,
 FROM transactions
 WHERE payer_user_id = $1 OR payee_user_id = $1
 ORDER BY created_at DESC
+LIMIT 1000
 `
 
 	rows, err := q.Query(ctx, query, userID)

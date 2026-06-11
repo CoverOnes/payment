@@ -324,6 +324,27 @@ func TestSettlementHandler_Disburse_ServiceError(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, w.Code, "service error must not return 200")
 }
 
+// TestSettlementHandler_Disburse_PlanNotFound_Returns404 pins that ErrPlanNotFound is
+// translated to HTTP 404 with code PLAN_NOT_FOUND. Previously the test only asserted
+// != 200; this test pins the exact status code so future error-mapping changes are caught.
+func TestSettlementHandler_Disburse_PlanNotFound_Returns404(t *testing.T) {
+	stub := &stubDisburser{err: domain.ErrPlanNotFound}
+
+	r := buildStubRouter(stub)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, disburseReq(t, disburseBody(t)))
+
+	require.Equal(t, http.StatusNotFound, w.Code, "ErrPlanNotFound must map to HTTP 404")
+
+	var resp struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "PLAN_NOT_FOUND", resp.Error.Code, "ErrPlanNotFound must produce PLAN_NOT_FOUND code")
+}
+
 // ─── Fix 2: IdempotencyKey is a no-op ────────────────────────────────────────
 
 // TestSettlementHandler_Disburse_IdempotencyKey_Noop verifies that:

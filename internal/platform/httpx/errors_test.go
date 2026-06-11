@@ -113,6 +113,29 @@ func TestTranslate_OtherErrors(t *testing.T) {
 			wantStatus: http.StatusInternalServerError,
 			wantMsg:    "internal server error",
 		},
+		// Fix #3 (re-review): ErrAllocationNotFound and ErrMilestoneDisbursementNotFound
+		// previously fell through to the default 500 branch. They must now map to 404.
+		{
+			name:       "ErrAllocationNotFound -> 404 NOT_FOUND",
+			err:        domain.ErrAllocationNotFound,
+			wantCode:   "NOT_FOUND",
+			wantStatus: http.StatusNotFound,
+			wantMsg:    "allocation not found",
+		},
+		{
+			name:       "ErrMilestoneDisbursementNotFound -> 404 NOT_FOUND",
+			err:        domain.ErrMilestoneDisbursementNotFound,
+			wantCode:   "NOT_FOUND",
+			wantStatus: http.StatusNotFound,
+			wantMsg:    "milestone disbursement not found",
+		},
+		{
+			name:       "wrapped ErrAllocationNotFound -> 404 NOT_FOUND",
+			err:        fmt.Errorf("fetch allocation: %w", domain.ErrAllocationNotFound),
+			wantCode:   "NOT_FOUND",
+			wantStatus: http.StatusNotFound,
+			wantMsg:    "allocation not found",
+		},
 	}
 
 	for _, tc := range table {

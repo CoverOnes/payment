@@ -342,12 +342,23 @@ func (s *SettlementService) disburseMilestoneTx(
 		return lockErr
 	}
 
-	if plan.Status == domain.PlanStatusCanceled {
-		return fmt.Errorf("%w: plan is CANCELED", domain.ErrInvalidTransition)
+	// Security: only ACTIVE plans may be disbursed.
+	// A COMPLETED plan must not be disbursable — a fresh set of milestoneIDs could drain
+	// escrow again because per-milestone idempotency only blocks same-(plan,milestone,vendor)
+	// replays, not new milestoneIDs against a completed plan.
+	if plan.Status != domain.PlanStatusActive {
+		return fmt.Errorf("%w: plan is %s (expected ACTIVE)", domain.ErrInvalidTransition, plan.Status)
 	}
 
 	// M-1 (Major): cumulative disbursement cap. Only enforced when plan.TotalAmount > 0
 	// (zero means cap was not set at creation — treated as uncapped, backwards-compatible).
+	//
+	// IMPORTANT: the correctness of this cap check depends on the plan-row FOR UPDATE lock
+	// (acquired above by GetByIDForUpdate) being held through the entire transaction.
+	// Without that lock, two concurrent DisburseMilestone calls could both read the same
+	// sumDisbursed, both pass the cap check, and together exceed plan.TotalAmount.
+	// The FOR UPDATE serializes concurrent calls: the second caller waits for the first
+	// to commit (updating sumDisbursed) before re-reading — ensuring the cap is enforced.
 	if plan.TotalAmount.GreaterThan(decimal.Zero) {
 		sumDisbursed, sumErr := disbursements.SumDisbursedByPlanID(ctx, in.PlanID)
 		if sumErr != nil {
