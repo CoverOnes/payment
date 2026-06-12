@@ -183,15 +183,20 @@ func computeGatewaySignature(secret []byte, c *gin.Context, ts string, body []by
 	return mac.Sum(nil)
 }
 
-// storeNonce attempts to set a Redis nonce key with TTL = maxGatewaySkew using
-// SET NX EX semantics. Returns true if the key was newly set (nonce is fresh),
-// false if the key already existed (replay detected).
+// storeNonce attempts to set a Redis nonce key using SET NX EX semantics.
+// Returns true if the key was newly set (nonce is fresh), false if the key
+// already existed (replay detected).
 // Redis errors are treated as a rejection (fail-closed security posture).
+//
+// TTL is set to maxGatewaySkew + 5s so the nonce outlives the skew window.
+// A TTL equal to maxGatewaySkew would allow replay at exactly T+30s: the nonce
+// expires at T+30s while a request timestamped T is still within the |±30s|
+// skew window at exactly T+30s.  The +5s buffer closes this boundary case.
 func storeNonce(ctx context.Context, rdb *redis.Client, requestID string) bool {
 	key := replayNoncePrefix + requestID
 	// SET key 1 NX EX <seconds>: only set if not exists.
 	// Returns nil error + "OK" on success; redis.Nil when key existed.
-	ok, err := rdb.SetNX(ctx, key, 1, maxGatewaySkew).Result()
+	ok, err := rdb.SetNX(ctx, key, 1, maxGatewaySkew+5*time.Second).Result()
 	if err != nil {
 		// Redis error: fail-closed (reject request) to avoid silently skipping
 		// replay protection under Redis outage.
