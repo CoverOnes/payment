@@ -148,6 +148,10 @@ type OutboxStore interface {
 	// DeletePublishedBefore removes published rows older than cutoff (retention janitor).
 	// Returns the count of deleted rows.
 	DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error)
+	// CountStaleUnpublished returns the number of unpublished outbox rows whose
+	// created_at is older than the given threshold. Used by the poller to alert on
+	// events that are stuck and never entering the poll batch (DB-side stale check).
+	CountStaleUnpublished(ctx context.Context, olderThan time.Time) (int64, error)
 }
 
 // SettlementTxManager runs a function inside a single Postgres transaction, providing

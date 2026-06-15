@@ -10,10 +10,22 @@ import (
 // It is enqueued inside the same DB transaction as the business operation and
 // delivered by the in-process poller (at-least-once; consumer MUST dedup on EventID).
 //
-// Consumer-side dedup: EventID is a unique key. Consumers must record seen event_ids
-// in their own idempotency table and skip duplicates. The outbox guarantees
-// at-least-once delivery; exactly-once is NOT guaranteed (a crash between publish
-// and mark can cause a re-deliver).
+// # Dedup strategy (outbox-level)
+//
+// EventID is a deterministic UUID derived from the business key:
+//   - contract_activated: uuid.NewSHA1(NameSpaceURL, "outbox:plan_created:<plan_id>")
+//   - contract_completed: uuid.NewSHA1(NameSpaceURL, "outbox:disburse:<plan_id>:<milestone_id>")
+//
+// The enqueue query uses ON CONFLICT (event_id) DO NOTHING, so a crash-retry that
+// calls persistPlan or disburseMilestoneTx again inserts the same EventID and the
+// duplicate row is silently dropped. Without deterministic EventIDs, every retry
+// produces a new random UUID and the ON CONFLICT guard never fires.
+//
+// # Consumer-side dedup
+//
+// The settlement service methods (CreatePlan, DisburseMilestone) are independently
+// idempotent via their own DB guards, so even if the same event is delivered twice
+// (at-least-once guarantee), no double-disburse occurs.
 //
 // ClaimedUntil is set atomically by PollReady to prevent concurrent pollers from
 // picking up the same row. MarkPublished and MarkFailed both clear it.

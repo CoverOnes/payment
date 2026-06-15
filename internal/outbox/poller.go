@@ -132,7 +132,7 @@ func (p *Poller) tick() {
 	}
 
 	p.deletePublished()
-	p.alertStale(events)
+	p.alertStale()
 }
 
 // processEvent dispatches one outbox event to the settlement service and marks it published or failed.
@@ -180,11 +180,9 @@ func (p *Poller) dispatch(ctx context.Context, evt *domain.OutboxEvent) error {
 	case channelContractCompleted:
 		return p.handleContractCompleted(ctx, evt)
 	default:
-		slog.Warn("payment outbox: unknown channel; marking as published to avoid infinite retry",
-			"channel", evt.Channel,
-			"event_id", evt.EventID)
-
-		return nil
+		// F4: return error so processEvent calls MarkFailed (retry + visible in stale alert)
+		// instead of MarkPublished (which silently swallows mis-routed events).
+		return fmt.Errorf("unknown outbox channel %q", evt.Channel)
 	}
 }
 
@@ -194,6 +192,9 @@ type contractActivatedPayload struct {
 	TenderID        uuid.UUID `json:"tender_id"`
 	PlanID          uuid.UUID `json:"plan_id"`
 	IdempotencyKey  string    `json:"idempotency_key"`
+	// Currency is the ISO 4217 settlement currency written by persistPlan at enqueue time.
+	// Falls back to "TWD" for events written before this field was added (F2 fix).
+	Currency string `json:"currency"`
 }
 
 // contractCompletedPayload is the payload stored in event_outbox for contract_completed events.
@@ -218,10 +219,17 @@ func (p *Poller) handleContractActivated(ctx context.Context, evt *domain.Outbox
 		pl.IdempotencyKey = "outbox_replay:" + evt.EventID.String()
 	}
 
+	// F2: read currency from payload (written by persistPlan since this fix).
+	// Fall back to "TWD" only for events written before the currency field was added.
+	currency := pl.Currency
+	if currency == "" {
+		currency = "TWD"
+	}
+
 	_, err := p.svc.CreatePlan(ctx, &service.CreatePlanInput{
 		MultiContractID: pl.MultiContractID,
 		TenderID:        pl.TenderID,
-		Currency:        "TWD",
+		Currency:        currency,
 		IdempotencyKey:  pl.IdempotencyKey,
 	})
 	if err != nil {
@@ -292,19 +300,27 @@ func (p *Poller) deletePublished() {
 	}
 }
 
-// alertStale logs a warning if any events in the current batch are older than
-// staleUnpublishedThreshold — these may be stuck due to persistent errors.
-func (p *Poller) alertStale(events []*domain.OutboxEvent) {
+// alertStale logs a warning for stale unpublished events via a DB-side count query.
+// This catches all stuck rows — including those that never enter the poll batch because
+// their next_attempt_at is in the future or claimed_until is set by a crashed poller.
+// The batch-scan approach (checking only polled events) was a blind spot: events stuck
+// in backoff or claim-window were invisible until they re-entered the batch.
+func (p *Poller) alertStale() {
+	alertCtx, alertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer alertCancel()
+
 	threshold := time.Now().UTC().Add(-staleUnpublishedThreshold)
 
-	for _, e := range events {
-		if e.CreatedAt.Before(threshold) && e.Attempts > 0 {
-			slog.Warn("payment outbox: stale unpublished event detected",
-				"outbox_id", e.ID,
-				"event_id", e.EventID,
-				"channel", e.Channel,
-				"attempts", e.Attempts,
-				"created_at", e.CreatedAt)
-		}
+	count, err := p.outbox.CountStaleUnpublished(alertCtx, threshold)
+	if err != nil {
+		slog.Warn("payment outbox: stale alert query failed", "err", err)
+
+		return
+	}
+
+	if count > 0 {
+		slog.Warn("payment outbox: stale unpublished events detected (DB-side count)",
+			"count", count,
+			"older_than", threshold)
 	}
 }

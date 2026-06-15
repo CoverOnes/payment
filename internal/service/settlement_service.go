@@ -249,19 +249,26 @@ func (s *SettlementService) persistPlan(
 		// Same-tx outbox enqueue: the contract_activated event is recorded atomically
 		// with the plan write. The poller replays it if the server crashes before
 		// marking it published; CreatePlan is idempotent so replay is safe.
+		//
+		// F3: EventID is deterministic per business key (plan_id) so that ON CONFLICT
+		// (event_id) DO NOTHING in the outbox store fires correctly on crash-retry,
+		// preventing two outbox rows for the same business event.
 		outboxPayload, _ := json.Marshal(map[string]any{
 			"multi_contract_id": in.MultiContractID,
 			"tender_id":         in.TenderID,
 			"plan_id":           plan.ID,
 			"idempotency_key":   in.IdempotencyKey,
+			"currency":          plan.Currency,
 		})
 		now := time.Now().UTC()
+
+		deterministicEventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("outbox:plan_created:"+plan.ID.String()))
 
 		return outbox.Enqueue(ctx, &domain.OutboxEvent{
 			ID:            uuid.New(),
 			AggregateType: "settlement_plan",
 			AggregateID:   plan.ID,
-			EventID:       uuid.New(),
+			EventID:       deterministicEventID,
 			Channel:       "payment.contract_activated",
 			Payload:       outboxPayload,
 			CreatedAt:     now,
@@ -475,6 +482,11 @@ func (s *SettlementService) disburseMilestoneTx(
 	// Deterministic rounding: computeAllocatedAmounts sorts by iteration order
 	// of lockedAllocs (ORDER BY id via ListByPlanIDForUpdate) so the rounding
 	// sink (last allocation by id) is stable across replays.
+	//
+	// F3: EventID is deterministic per (plan_id, milestone_id) so that ON CONFLICT
+	// (event_id) DO NOTHING fires correctly on crash-retry, preventing duplicate
+	// outbox rows for the same business event. The outbox store's ON CONFLICT guard
+	// is only effective when EventID is stable across retries.
 	outboxPayload, _ := json.Marshal(map[string]any{
 		"plan_id":      in.PlanID,
 		"milestone_id": in.MilestoneID,
@@ -484,11 +496,14 @@ func (s *SettlementService) disburseMilestoneTx(
 	})
 	now := time.Now().UTC()
 
+	deterministicEventID := uuid.NewSHA1(uuid.NameSpaceURL,
+		[]byte("outbox:disburse:"+in.PlanID.String()+":"+in.MilestoneID.String()))
+
 	return outbox.Enqueue(ctx, &domain.OutboxEvent{
 		ID:            uuid.New(),
 		AggregateType: "settlement_plan",
 		AggregateID:   in.PlanID,
-		EventID:       uuid.New(),
+		EventID:       deterministicEventID,
 		Channel:       "payment.contract_completed",
 		Payload:       outboxPayload,
 		CreatedAt:     now,

@@ -57,6 +57,10 @@ func (s *txOutboxStore) DeletePublishedBefore(ctx context.Context, cutoff time.T
 	return deleteOutboxPublishedBefore(ctx, s.tx, cutoff)
 }
 
+func (s *txOutboxStore) CountStaleUnpublished(ctx context.Context, olderThan time.Time) (int64, error) {
+	return countStaleUnpublished(ctx, s.tx, olderThan)
+}
+
 // --- pool-backed methods ---
 
 // Enqueue inserts a new outbox event row.
@@ -86,6 +90,12 @@ func (s *OutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, lastErr stri
 // DeletePublishedBefore removes published rows older than cutoff. Returns the number of rows deleted.
 func (s *OutboxStore) DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	return deleteOutboxPublishedBefore(ctx, s.q, cutoff)
+}
+
+// CountStaleUnpublished returns the count of unpublished rows older than olderThan.
+// Used by the poller to alert on events stuck outside the poll batch (DB-side stale check).
+func (s *OutboxStore) CountStaleUnpublished(ctx context.Context, olderThan time.Time) (int64, error) {
+	return countStaleUnpublished(ctx, s.q, olderThan)
 }
 
 // --- shared helpers ---
@@ -223,6 +233,23 @@ WHERE published_at IS NOT NULL
 	}
 
 	return tag.RowsAffected(), nil
+}
+
+func countStaleUnpublished(ctx context.Context, q querier, olderThan time.Time) (int64, error) {
+	const query = `
+SELECT COUNT(*)
+FROM event_outbox
+WHERE published_at IS NULL
+  AND created_at < $1
+`
+
+	var n int64
+
+	if err := q.QueryRow(ctx, query, olderThan).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count stale unpublished outbox rows: %w", err)
+	}
+
+	return n, nil
 }
 
 func scanOutboxEvent(row rowScanner) (*domain.OutboxEvent, error) {
