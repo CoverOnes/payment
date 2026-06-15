@@ -758,6 +758,7 @@ func (m *failingTxManager) WithSettlementTx(
 		disbursements store.SettlementMilestoneDisbursementStore,
 		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
+		outbox store.OutboxStore,
 	) error,
 ) error {
 	return m.delegate.WithSettlementTx(ctx, func(
@@ -767,6 +768,7 @@ func (m *failingTxManager) WithSettlementTx(
 		disbursements store.SettlementMilestoneDisbursementStore,
 		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
+		outbox store.OutboxStore,
 	) error {
 		// Substitute a failing TransactionStore for the target vendor.
 		wrapped := &failingTxTxStore{
@@ -774,7 +776,7 @@ func (m *failingTxManager) WithSettlementTx(
 			failVendor:  m.failVendor,
 			platformUID: m.platformUID,
 		}
-		return fn(ctx, plans, allocs, disbursements, wrapped, audit)
+		return fn(ctx, plans, allocs, disbursements, wrapped, audit, outbox)
 	})
 }
 

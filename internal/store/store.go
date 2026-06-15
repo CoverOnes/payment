@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/CoverOnes/payment/internal/domain"
 	"github.com/google/uuid"
@@ -128,13 +129,40 @@ type SettlementMilestoneDisbursementStore interface {
 	SumDisbursedByPlanID(ctx context.Context, planID uuid.UUID) (decimal.Decimal, error)
 }
 
+// OutboxStore defines persistence operations for the transactional outbox table.
+// All writes happen inside the same DB transaction as the business operation they record
+// (same-tx enqueue pattern). Reads (PollReady) are issued by the in-process poller on
+// its own connection — not inside a business transaction.
+type OutboxStore interface {
+	// Enqueue inserts a new outbox event. ON CONFLICT (event_id) DO NOTHING makes
+	// re-enqueue of the same EventID a safe no-op (idempotent at DB level).
+	Enqueue(ctx context.Context, e *domain.OutboxEvent) error
+	// PollReady atomically claims up to limit unpublished rows eligible for delivery.
+	// Uses SELECT ... FOR UPDATE SKIP LOCKED so concurrent pollers claim disjoint sets.
+	PollReady(ctx context.Context, limit int) ([]*domain.OutboxEvent, error)
+	// MarkPublished sets published_at = now() and clears claimed_until.
+	MarkPublished(ctx context.Context, id uuid.UUID) error
+	// MarkFailed increments attempts, records last_error, advances next_attempt_at
+	// with exponential backoff, and clears claimed_until so the row is re-pollable.
+	MarkFailed(ctx context.Context, id uuid.UUID, lastErr string) error
+	// DeletePublishedBefore removes published rows older than cutoff (retention janitor).
+	// Returns the count of deleted rows.
+	DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error)
+	// CountStaleUnpublished returns the number of unpublished outbox rows whose
+	// created_at is older than the given threshold. Used by the poller to alert on
+	// events that are stuck and never entering the poll batch (DB-side stale check).
+	CountStaleUnpublished(ctx context.Context, olderThan time.Time) (int64, error)
+}
+
 // SettlementTxManager runs a function inside a single Postgres transaction, providing
-// transactional access to all five settlement stores atomically.
+// transactional access to all settlement stores atomically.
 // The tx-scoped plan and allocation stores expose FOR UPDATE methods unavailable
 // on the pool-backed stores, ensuring row-level locking can only happen inside a tx.
 // txTxStore is a tx-scoped TransactionStore ensuring the transactions row and the
 // settlement_milestone_disbursements row are written in ONE transaction (atomicity fix).
-// Used by the disburse service: lock plan + lock allocations + write disbursement + write tx + write audit.
+// outbox is a tx-scoped OutboxStore so the event_outbox row is committed atomically
+// with the business operation (same-tx enqueue: enqueue + business write in one tx).
+// Used by the service: write plan/disbursement + enqueue outbox event atomically.
 type SettlementTxManager interface {
 	WithSettlementTx(
 		ctx context.Context,
@@ -145,6 +173,7 @@ type SettlementTxManager interface {
 			disbursements SettlementMilestoneDisbursementStore,
 			txTxStore TransactionStore,
 			audit SettlementAuditStore,
+			outbox OutboxStore,
 		) error,
 	) error
 }

@@ -197,7 +197,9 @@ func buildPlanWithAllocations(in *CreatePlanInput, roster []RosterEntry) (*domai
 	return plan, allocationRows
 }
 
-// persistPlan atomically writes the plan, allocations, and PLAN_CREATED audit entry.
+// persistPlan atomically writes the plan, allocations, PLAN_CREATED audit entry,
+// and a contract_activated outbox event so the plan creation is replayable via
+// the outbox poller (at-least-once, idempotent).
 func (s *SettlementService) persistPlan(
 	ctx context.Context,
 	plan *domain.SettlementPlan,
@@ -211,6 +213,7 @@ func (s *SettlementService) persistPlan(
 		_ store.SettlementMilestoneDisbursementStore,
 		_ store.TransactionStore,
 		audit store.SettlementAuditStore,
+		outbox store.OutboxStore,
 	) error {
 		if planErr := plans.Create(ctx, plan); planErr != nil {
 			if errors.Is(planErr, domain.ErrDuplicateKey) {
@@ -226,19 +229,50 @@ func (s *SettlementService) persistPlan(
 			}
 		}
 
-		payload, _ := json.Marshal(map[string]any{
+		auditPayload, _ := json.Marshal(map[string]any{
 			"multi_contract_id":  in.MultiContractID,
 			"tender_id":          in.TenderID,
 			"frozen_party_count": len(allocationRows),
 		})
 
-		return audit.Append(ctx, &domain.SettlementAuditEntry{
+		if auditErr := audit.Append(ctx, &domain.SettlementAuditEntry{
 			ID:           uuid.New(),
 			PlanID:       plan.ID,
 			EventType:    "PLAN_CREATED",
 			ActorService: "payment",
-			Payload:      payload,
+			Payload:      auditPayload,
 			OccurredAt:   time.Now().UTC(),
+		}); auditErr != nil {
+			return fmt.Errorf("append PLAN_CREATED audit: %w", auditErr)
+		}
+
+		// Same-tx outbox enqueue: the contract_activated event is recorded atomically
+		// with the plan write. The poller replays it if the server crashes before
+		// marking it published; CreatePlan is idempotent so replay is safe.
+		//
+		// F3: EventID is deterministic per business key (plan_id) so that ON CONFLICT
+		// (event_id) DO NOTHING in the outbox store fires correctly on crash-retry,
+		// preventing two outbox rows for the same business event.
+		outboxPayload, _ := json.Marshal(map[string]any{
+			"multi_contract_id": in.MultiContractID,
+			"tender_id":         in.TenderID,
+			"plan_id":           plan.ID,
+			"idempotency_key":   in.IdempotencyKey,
+			"currency":          plan.Currency,
+		})
+		now := time.Now().UTC()
+
+		deterministicEventID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("outbox:plan_created:"+plan.ID.String()))
+
+		return outbox.Enqueue(ctx, &domain.OutboxEvent{
+			ID:            uuid.New(),
+			AggregateType: "settlement_plan",
+			AggregateID:   plan.ID,
+			EventID:       deterministicEventID,
+			Channel:       "payment.contract_activated",
+			Payload:       outboxPayload,
+			CreatedAt:     now,
+			NextAttemptAt: now,
 		})
 	})
 }
@@ -316,8 +350,9 @@ func (s *SettlementService) DisburseMilestone(ctx context.Context, in *DisburseM
 		disbursements store.SettlementMilestoneDisbursementStore,
 		txTxStore store.TransactionStore,
 		audit store.SettlementAuditStore,
+		outbox store.OutboxStore,
 	) error {
-		return s.disburseMilestoneTx(ctx, in, plans, allocs, disbursements, txTxStore, audit, &disbursedAmounts, &outcomes)
+		return s.disburseMilestoneTx(ctx, in, plans, allocs, disbursements, txTxStore, audit, outbox, &disbursedAmounts, &outcomes)
 	})
 
 	if txErr != nil {
@@ -349,6 +384,7 @@ func (s *SettlementService) disburseMilestoneTx(
 	disbursements store.SettlementMilestoneDisbursementStore,
 	txTxStore store.TransactionStore,
 	audit store.SettlementAuditStore,
+	outbox store.OutboxStore,
 	disbursedAmounts *[]decimal.Decimal,
 	outcomes *[]VendorDisburseOutcome,
 ) error {
@@ -434,7 +470,45 @@ func (s *SettlementService) disburseMilestoneTx(
 		})
 	}
 
-	return nil
+	// Same-tx outbox enqueue: the completed event is recorded atomically with
+	// the disbursement writes. The poller replays it on crash-recovery;
+	// DisburseMilestone is idempotent (ON CONFLICT DO NOTHING on disbursement rows).
+	//
+	// Triple sum-check on every replay: the poller calls DisburseMilestone again;
+	// the existing settlement_milestone_disbursements rows are DISBURSED so each
+	// allocation is skipped (idempotent). The outbox event carries the milestone
+	// amount + currency so the replay call uses the identical input.
+	//
+	// Deterministic rounding: computeAllocatedAmounts sorts by iteration order
+	// of lockedAllocs (ORDER BY id via ListByPlanIDForUpdate) so the rounding
+	// sink (last allocation by id) is stable across replays.
+	//
+	// F3: EventID is deterministic per (plan_id, milestone_id) so that ON CONFLICT
+	// (event_id) DO NOTHING fires correctly on crash-retry, preventing duplicate
+	// outbox rows for the same business event. The outbox store's ON CONFLICT guard
+	// is only effective when EventID is stable across retries.
+	outboxPayload, _ := json.Marshal(map[string]any{
+		"plan_id":      in.PlanID,
+		"milestone_id": in.MilestoneID,
+		"amount":       in.Amount.StringFixed(2),
+		"currency":     in.Currency,
+		"actor":        in.ActorService,
+	})
+	now := time.Now().UTC()
+
+	deterministicEventID := uuid.NewSHA1(uuid.NameSpaceURL,
+		[]byte("outbox:disburse:"+in.PlanID.String()+":"+in.MilestoneID.String()))
+
+	return outbox.Enqueue(ctx, &domain.OutboxEvent{
+		ID:            uuid.New(),
+		AggregateType: "settlement_plan",
+		AggregateID:   in.PlanID,
+		EventID:       deterministicEventID,
+		Channel:       "payment.contract_completed",
+		Payload:       outboxPayload,
+		CreatedAt:     now,
+		NextAttemptAt: now,
+	})
 }
 
 // buildDisburseResult aggregates per-vendor outcomes into a DisburseResult summary.

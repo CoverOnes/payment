@@ -17,6 +17,7 @@ import (
 	"github.com/CoverOnes/payment/internal/consumer"
 	"github.com/CoverOnes/payment/internal/events"
 	"github.com/CoverOnes/payment/internal/handler"
+	"github.com/CoverOnes/payment/internal/outbox"
 	"github.com/CoverOnes/payment/internal/platform/logger"
 	"github.com/CoverOnes/payment/internal/service"
 	"github.com/CoverOnes/payment/internal/store/postgres"
@@ -138,6 +139,7 @@ func run() error {
 	settlementMilestoneDisburseStore := postgres.NewSettlementMilestoneDisbursementStore(pool)
 	settlementAuditStore := postgres.NewSettlementAuditStore(pool)
 	settlementTxMgr := postgres.NewSettlementTxManager(pool)
+	outboxStore := postgres.NewOutboxStore(pool)
 
 	// Workspace roster client (S2S call to workspace to fetch frozen party roster).
 	rosterClient := workspaceclient.NewHTTPRosterClient(
@@ -160,17 +162,24 @@ func run() error {
 
 	// Start settlement event consumers (workspace.contract_activated + workspace.contract_completed).
 	// Only wired when Redis is available — dev without Redis skips consumers gracefully.
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
 	if redisClient != nil {
 		settlementConsumer := consumer.NewSettlementConsumer(redisClient, settlementSvc)
-
-		serverCtx, serverCancel := context.WithCancel(context.Background())
-		defer serverCancel()
 
 		go settlementConsumer.Start(serverCtx)
 		slog.Info("settlement event consumer started")
 	} else {
 		slog.Warn("redis not connected; settlement event consumers not started")
 	}
+
+	// Outbox poller — replays undelivered settlement events across server restarts.
+	// Runs unconditionally (no Redis dependency); poll interval 2s.
+	outboxPoller := outbox.NewPoller(outboxStore, settlementSvc, 2*time.Second)
+
+	go outboxPoller.Run(serverCtx)
+	slog.Info("payment outbox poller started")
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
