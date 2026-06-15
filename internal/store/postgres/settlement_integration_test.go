@@ -342,6 +342,7 @@ func TestSettlementTxManager_Integration(t *testing.T) {
 			_ storeDisburseStore,
 			_ storeTxTransactionStore,
 			audit storeAuditEntry,
+			_ store.OutboxStore,
 		) error {
 			// Lock the plan.
 			locked, lockErr := plans.GetByIDForUpdate(ctx, plan.ID)
@@ -412,6 +413,7 @@ func TestSettlementTxManager_Integration(t *testing.T) {
 			_ storeDisburseStore,
 			_ storeTxTransactionStore,
 			_ storeAuditEntry,
+			_ store.OutboxStore,
 		) error {
 			// Mutate — but then return error to trigger rollback.
 			require.NoError(t, plans.UpdateStatus(ctx, plan2.ID, domain.PlanStatusCompleted))
