@@ -11,6 +11,7 @@ import (
 
 	"github.com/CoverOnes/payment/internal/service"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // rosterResponseBody is the JSON shape of GET /internal/v1/contracts/:id/parties.
@@ -28,6 +29,9 @@ type rosterEntryJSON struct {
 const (
 	// maxRosterBodyBytes caps the response body to prevent DoS (backend-security-design).
 	maxRosterBodyBytes = 64 * 1024 // 64 KiB — plenty for any realistic roster
+
+	// maxAmountsBodyBytes caps the milestone-amounts response body (small single-field JSON).
+	maxAmountsBodyBytes = 4 * 1024 // 4 KiB — sufficient for {"data":{"totalAmount":"999999999999.99"}}
 
 	// rosterRequestTimeout is the per-call deadline for the workspace S2S request.
 	rosterRequestTimeout = 10 * time.Second
@@ -111,4 +115,58 @@ func (c *HTTPRosterClient) GetPartyRoster(ctx context.Context, contractID uuid.U
 	}
 
 	return entries, nil
+}
+
+// milestoneAmountsResponseBody is the JSON shape of GET /internal/v1/contracts/:id/milestones/amounts.
+// The workspace service wraps data in {"data": {...}} per its httpx.OK envelope.
+type milestoneAmountsResponseBody struct {
+	Data struct {
+		TotalAmount string `json:"totalAmount"`
+	} `json:"data"`
+}
+
+// GetMilestoneAmountsSum calls GET <workspace>/internal/v1/contracts/:id/milestones/amounts
+// and returns the Σ of ALL milestone amounts for the contract as a decimal.Decimal.
+// Returns decimal.Zero when no milestones exist (no error — caller treats it as uncapped).
+// Returns an error if the workspace endpoint is unreachable or returns non-200.
+func (c *HTTPRosterClient) GetMilestoneAmountsSum(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error) {
+	// G107 (gosec): URL built from c.baseURL + uuid.UUID. baseURL is validated at
+	// config load (validateWorkspace enforces https:// prefix); contractID is a
+	// uuid.UUID — not user-controlled. No path traversal or injection is possible.
+	url := fmt.Sprintf("%s/internal/v1/contracts/%s/milestones/amounts", c.baseURL, contractID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("build workspace milestone-amounts request: %w", err)
+	}
+
+	// Credentials in headers — NEVER in the URL (backend-security-design §4.2).
+	req.Header.Set("X-Service-Id", "payment")
+	req.Header.Set("X-Service-Token", c.serviceToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("workspace milestone-amounts GET: %w", err)
+	}
+
+	defer resp.Body.Close() //nolint:errcheck // best-effort close on HTTP response body
+
+	if resp.StatusCode != http.StatusOK {
+		return decimal.Zero, fmt.Errorf("workspace milestone-amounts returned status %d for contract %s", resp.StatusCode, contractID)
+	}
+
+	// Body limit — DoS prevention (backend-security-design).
+	limited := io.LimitReader(resp.Body, maxAmountsBodyBytes)
+
+	var body milestoneAmountsResponseBody
+	if decErr := json.NewDecoder(limited).Decode(&body); decErr != nil {
+		return decimal.Zero, fmt.Errorf("decode workspace milestone-amounts response: %w", decErr)
+	}
+
+	amt, parseErr := decimal.NewFromString(body.Data.TotalAmount)
+	if parseErr != nil {
+		return decimal.Zero, fmt.Errorf("parse workspace milestone-amounts totalAmount %q: %w", body.Data.TotalAmount, parseErr)
+	}
+
+	return amt, nil
 }

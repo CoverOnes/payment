@@ -29,12 +29,16 @@ type SettlementService struct {
 	platformUID   uuid.UUID // PayerUserID for all disburse transactions (self-transfer guard)
 }
 
-// WorkspaceRosterClient fetches the frozen ACTIVE-party roster from the workspace service.
+// WorkspaceRosterClient fetches roster and milestone aggregate data from the workspace service.
 // Abstracted so tests can inject a stub without a real HTTP server.
 type WorkspaceRosterClient interface {
 	// GetPartyRoster calls GET <workspace>/internal/v1/contracts/:id/parties
 	// and returns the frozen [{vendorUserId, shareBps}] roster.
 	GetPartyRoster(ctx context.Context, contractID uuid.UUID) ([]RosterEntry, error)
+	// GetMilestoneAmountsSum calls GET <workspace>/internal/v1/contracts/:id/milestones/amounts
+	// and returns the sum of ALL milestone amounts for the contract (the escrow cap).
+	// Returns decimal.Zero when no milestones exist (uncapped passthrough in CreatePlan).
+	GetMilestoneAmountsSum(ctx context.Context, contractID uuid.UUID) (decimal.Decimal, error)
 }
 
 // RosterEntry is one party in the frozen ACTIVE roster returned by the workspace S2S endpoint.
@@ -123,6 +127,17 @@ func (s *SettlementService) CreatePlan(ctx context.Context, in *CreatePlanInput)
 	if err := validateRosterSum(roster); err != nil {
 		return nil, err
 	}
+
+	// Fetch the escrow disbursement cap: Σ of ALL milestone amounts known at CreatePlan time.
+	// This is the authoritative cap — fetched S2S from workspace so it cannot be forged via
+	// an unsigned Redis event. decimal.Zero means no milestones yet; DisburseMilestone treats
+	// TotalAmount==0 as "uncapped" for backwards-compat (see disburseMilestoneTx).
+	milestoneSum, err := s.roster.GetMilestoneAmountsSum(ctx, in.MultiContractID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch milestone amounts sum from workspace: %w", err)
+	}
+
+	in.TotalAmount = milestoneSum
 
 	plan, allocationRows := buildPlanWithAllocations(in, roster)
 

@@ -139,14 +139,35 @@ func runMigrations(_ *testing.T, _ context.Context, _ string) {
 // ─── Stub roster client ───────────────────────────────────────────────────────
 
 // stubRosterClient is a test double for WorkspaceRosterClient.
+// milestoneSum controls the value returned by GetMilestoneAmountsSum.
+// By default (zero value) it is decimal.Zero, which CreatePlan treats as uncapped.
 type stubRosterClient struct {
-	mu      sync.Mutex
-	entries []service.RosterEntry
-	err     error
+	mu           sync.Mutex
+	entries      []service.RosterEntry
+	err          error
+	milestoneSum decimal.Decimal
 }
 
 func newStubRoster(entries ...service.RosterEntry) *stubRosterClient {
 	return &stubRosterClient{entries: entries}
+}
+
+// withMilestoneSum returns the stub configured with a fixed milestone sum.
+func (s *stubRosterClient) withMilestoneSum(sum decimal.Decimal) *stubRosterClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.milestoneSum = sum
+
+	return s
+}
+
+// withError makes both GetPartyRoster and GetMilestoneAmountsSum return the given error.
+func (s *stubRosterClient) withError(err error) *stubRosterClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+
+	return s
 }
 
 func (s *stubRosterClient) GetPartyRoster(_ context.Context, _ uuid.UUID) ([]service.RosterEntry, error) {
@@ -161,6 +182,17 @@ func (s *stubRosterClient) GetPartyRoster(_ context.Context, _ uuid.UUID) ([]ser
 	copy(cp, s.entries)
 
 	return cp, nil
+}
+
+func (s *stubRosterClient) GetMilestoneAmountsSum(_ context.Context, _ uuid.UUID) (decimal.Decimal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.err != nil {
+		return decimal.Zero, s.err
+	}
+
+	return s.milestoneSum, nil
 }
 
 // ─── Test suite ──────────────────────────────────────────────────────────────
@@ -1662,25 +1694,25 @@ func TestSettlementService_DisburseMilestone_CumulativeCap(t *testing.T) {
 	dsn := startTestDB(t)
 
 	vendor1, vendor2 := uuid.New(), uuid.New()
+	totalAmount, _ := decimal.NewFromString("5000.00")
+
+	// Configure the stub milestone sum so CreatePlan receives the cap via S2S.
 	roster := newStubRoster(
 		service.RosterEntry{VendorUserID: vendor1, ShareBps: 6000},
 		service.RosterEntry{VendorUserID: vendor2, ShareBps: 4000},
-	)
+	).withMilestoneSum(totalAmount)
 
 	svc := buildService(t, ctx, dsn, roster)
-
-	totalAmount, _ := decimal.NewFromString("5000.00")
 
 	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
 		MultiContractID: uuid.New(),
 		TenderID:        uuid.New(),
 		Currency:        "TWD",
-		TotalAmount:     totalAmount,
 		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, plan)
-	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must be persisted at creation")
+	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must equal the S2S milestone sum")
 
 	milestone1 := uuid.New()
 	amount1, _ := decimal.NewFromString("3000.00")
@@ -1887,27 +1919,28 @@ func TestSettlementService_DisburseMilestone_ConcurrentCapEnforcement(t *testing
 	runMigrations(t, ctx, dsn)
 
 	vendor1 := uuid.New()
-	// Single-vendor plan to keep concurrent disbursement counts simple.
-	roster := newStubRoster(
-		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
-	)
-
-	svc := buildService(t, ctx, dsn, roster)
 
 	// TotalAmount = 3000. Two concurrent calls each with 2000 — individually within cap
 	// (2000 < 3000), but together they sum to 4000 > 3000.
 	totalAmount, _ := decimal.NewFromString("3000.00")
 
+	// Single-vendor plan to keep concurrent disbursement counts simple.
+	// Configure the stub milestone sum so CreatePlan receives the cap via S2S.
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	).withMilestoneSum(totalAmount)
+
+	svc := buildService(t, ctx, dsn, roster)
+
 	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
 		MultiContractID: uuid.New(),
 		TenderID:        uuid.New(),
 		Currency:        "TWD",
-		TotalAmount:     totalAmount,
 		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, plan)
-	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must be set")
+	require.True(t, plan.TotalAmount.Equal(totalAmount), "plan.TotalAmount must equal the S2S milestone sum")
 
 	callAmount, _ := decimal.NewFromString("2000.00") // 2000 < 3000 → individually passes cap
 
@@ -1968,4 +2001,188 @@ func TestSettlementService_DisburseMilestone_ConcurrentCapEnforcement(t *testing
 	assert.True(t, totalDisbursed.LessThanOrEqual(totalAmount),
 		"total disbursed %s must not exceed TotalAmount %s",
 		totalDisbursed.StringFixed(2), totalAmount.StringFixed(2))
+}
+
+// ─── M-1 S2S wiring tests ─────────────────────────────────────────────────────
+
+// TestSettlementService_CreatePlan_SetsTotalAmountFromS2S verifies that
+// CreatePlan populates plan.TotalAmount from the WorkspaceRosterClient.GetMilestoneAmountsSum
+// S2S call — NOT from any caller-supplied TotalAmount field.
+//
+// Case (a): CreatePlan sets plan.TotalAmount from the stubbed sum.
+func TestSettlementService_CreatePlan_SetsTotalAmountFromS2S(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1, vendor2 := uuid.New(), uuid.New()
+	expectedSum, _ := decimal.NewFromString("7500.00")
+
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 7000},
+		service.RosterEntry{VendorUserID: vendor2, ShareBps: 3000},
+	).withMilestoneSum(expectedSum)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	// TotalAmount must come from the S2S stub, regardless of what was (not) passed in input.
+	require.True(t, plan.TotalAmount.Equal(expectedSum),
+		"plan.TotalAmount must equal S2S sum %s, got %s",
+		expectedSum.StringFixed(2), plan.TotalAmount.StringFixed(2))
+}
+
+// TestSettlementService_CreatePlan_MilestoneRosterError verifies that CreatePlan
+// propagates an error from GetMilestoneAmountsSum and does not create a plan.
+func TestSettlementService_CreatePlan_MilestoneRosterError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+	sentinelErr := fmt.Errorf("workspace service unavailable")
+
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	).withError(sentinelErr)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.Error(t, err, "must fail when S2S milestone sum call errors")
+	require.Nil(t, plan, "no plan must be created on S2S failure")
+}
+
+// TestSettlementService_DisburseMilestone_NoMilestonesUncapped verifies that
+// when the workspace returns sum=0 (no milestones yet), plan.TotalAmount=0
+// and disbursement is unlimited (uncapped passthrough).
+//
+// Case (d): no-milestones (sum=0) → uncapped passthrough.
+func TestSettlementService_DisburseMilestone_NoMilestonesUncapped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+
+	// Stub returns sum = 0 (no milestones configured for this contract).
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	).withMilestoneSum(decimal.Zero)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	// plan.TotalAmount == 0 → cap disabled.
+	require.True(t, plan.TotalAmount.IsZero(), "plan.TotalAmount must be zero when no milestones exist")
+
+	// A large disburse amount should succeed because the cap is disabled.
+	largeAmount, _ := decimal.NewFromString("999999.99")
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  uuid.New(),
+		Amount:       largeAmount,
+		Currency:     "TWD",
+		ActorService: "test-uncapped",
+	})
+	require.NoError(t, err, "disbursement must succeed when TotalAmount=0 (uncapped)")
+}
+
+// TestSettlementService_DisburseMilestone_ExactlyAtCap verifies that a cumulative
+// disbursement that equals the cap exactly is accepted (boundary case).
+//
+// Case (c): exactly-cap accepted.
+func TestSettlementService_DisburseMilestone_ExactlyAtCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	vendor1 := uuid.New()
+	totalCap, _ := decimal.NewFromString("1000.00")
+
+	roster := newStubRoster(
+		service.RosterEntry{VendorUserID: vendor1, ShareBps: 10000},
+	).withMilestoneSum(totalCap)
+
+	svc := buildService(t, ctx, dsn, roster)
+
+	plan, err := svc.CreatePlan(ctx, &service.CreatePlanInput{
+		MultiContractID: uuid.New(),
+		TenderID:        uuid.New(),
+		Currency:        "TWD",
+		IdempotencyKey:  "contract_activated:" + uuid.New().String(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	require.True(t, plan.TotalAmount.Equal(totalCap))
+
+	// First disburse: 600.00 of 1000.00.
+	amt1, _ := decimal.NewFromString("600.00")
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  uuid.New(),
+		Amount:       amt1,
+		Currency:     "TWD",
+		ActorService: "test-exact-cap",
+	})
+	require.NoError(t, err, "first disburse (600/1000) must succeed")
+
+	// Second disburse: exactly 400.00 (cumulative == cap).
+	amt2, _ := decimal.NewFromString("400.00")
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  uuid.New(),
+		Amount:       amt2,
+		Currency:     "TWD",
+		ActorService: "test-exact-cap",
+	})
+	require.NoError(t, err, "second disburse (cumulative == cap) must succeed")
+
+	// One more cent over cap must be rejected.
+	oneCent, _ := decimal.NewFromString("0.01")
+	_, err = svc.DisburseMilestone(ctx, &service.DisburseMilestoneInput{
+		PlanID:       plan.ID,
+		MilestoneID:  uuid.New(),
+		Amount:       oneCent,
+		Currency:     "TWD",
+		ActorService: "test-exact-cap",
+	})
+	require.Error(t, err, "disburse after hitting exact cap must be rejected")
+	require.ErrorIs(t, err, domain.ErrValidation, "over-cap must return ErrValidation")
 }
