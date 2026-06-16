@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -60,6 +61,22 @@ type Config struct {
 	// chmod 0600 the file that provides it; prefer the env var as canonical.
 	// Env: PAYMENT_GATEWAY_HMAC_SECRET
 	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
+
+	// GatewayCIDR is the IP CIDR of the API gateway/load-balancer that forwards
+	// requests to this service. When set, Gin is told to trust X-Forwarded-For
+	// only from this source, so c.ClientIP() returns the real end-user IP rather
+	// than the gateway's IP. This restores per-client behavior the gateway
+	// keystone depends on:
+	//   - the IP rate limiter keys per real client IP (not one shared gateway
+	//     bucket — otherwise the limiter collapses to a single global bucket /
+	//     self-DoS behind the gateway).
+	// Example: "10.0.0.0/16" (k8s cluster CIDR), "172.16.0.0/12" (VPC internal).
+	// Empty (default): trusted-proxy list is nil — c.ClientIP() returns RemoteAddr
+	// (safe fallback; use in local dev when no proxy forwards X-Forwarded-For).
+	// NEVER set to "0.0.0.0/0" / "::/0": that lets any client spoof their IP via
+	// the header, defeating per-client rate limiting.
+	// Env: PAYMENT_GATEWAY_CIDR
+	GatewayCIDR string `mapstructure:"gateway_cidr"`
 
 	// SettlementS2SToken is the shared secret used by the S2S middleware on the
 	// settlement disburse endpoint (backend-security-design §5.5).
@@ -124,6 +141,7 @@ func Load() (*Config, error) {
 		"log_level":               "PAYMENT_LOG_LEVEL",
 		"env":                     "PAYMENT_ENV",
 		"gateway_hmac_secret":     "PAYMENT_GATEWAY_HMAC_SECRET",
+		"gateway_cidr":            "PAYMENT_GATEWAY_CIDR",
 		"settlement_s2s_token":    "PAYMENT_SETTLEMENT_S2S_TOKEN",
 		"workspace_base_url":      "PAYMENT_WORKSPACE_BASE_URL",
 		"workspace_s2s_token":     "PAYMENT_WORKSPACE_S2S_TOKEN",
@@ -206,6 +224,7 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateGatewayHMAC()...)
+	errs = append(errs, c.validateGatewayCIDR()...)
 	errs = append(errs, c.validateSettlementS2SToken()...)
 	errs = append(errs, c.validateWorkspace()...)
 	errs = append(errs, c.validateRedis()...)
@@ -251,6 +270,33 @@ func (c *Config) validateGatewayHMAC() []string {
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// validateGatewayCIDR validates PAYMENT_GATEWAY_CIDR and returns any error messages.
+// An empty CIDR is valid (trusted-proxy list falls back to nil, safe for local dev).
+// A non-empty value must be a valid CIDR block (e.g. "10.0.0.0/16").
+// NEVER set to "0.0.0.0/0" / "::/0" — that allows clients to spoof their IP via
+// X-Forwarded-For, collapsing the per-IP rate limiter into one shared bucket.
+func (c *Config) validateGatewayCIDR() []string {
+	if c.GatewayCIDR == "" {
+		return nil
+	}
+
+	_, ipNet, err := net.ParseCIDR(c.GatewayCIDR)
+	if err != nil {
+		return []string{fmt.Sprintf("PAYMENT_GATEWAY_CIDR must be a valid CIDR block (e.g. 10.0.0.0/16): %v", err)}
+	}
+
+	// Reject wildcard CIDRs (0.0.0.0/0, ::/0): trusting all peers lets any client
+	// spoof their IP via X-Forwarded-For, defeating per-client rate limiting.
+	if ones, _ := ipNet.Mask.Size(); ones == 0 {
+		return []string{
+			"PAYMENT_GATEWAY_CIDR must not be a wildcard (0.0.0.0/0 or ::/0): " +
+				"it lets any client spoof their IP via X-Forwarded-For",
+		}
+	}
+
+	return nil
 }
 
 // minS2STokenLen is the minimum length of the settlement S2S token.

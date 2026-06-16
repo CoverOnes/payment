@@ -747,3 +747,71 @@ func TestLoad_Redis_Auth(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_GatewayCIDR validates PAYMENT_GATEWAY_CIDR parsing and the wildcard
+// rejection (ClientIP trust chain). Empty is the safe dev default; a valid CIDR
+// loads; an unparseable value and the wildcard CIDRs (0.0.0.0/0, ::/0) are
+// rejected at boot so a client can never spoof its IP via X-Forwarded-For.
+func TestLoad_GatewayCIDR(t *testing.T) {
+	tests := []struct {
+		name      string
+		cidr      string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "empty is valid (dev default, proxy trust disabled)",
+			cidr:    "",
+			wantErr: false,
+		},
+		{
+			name:    "valid IPv4 CIDR loads",
+			cidr:    "10.0.0.0/16",
+			wantErr: false,
+		},
+		{
+			name:    "valid IPv6 CIDR loads",
+			cidr:    "fd00::/8",
+			wantErr: false,
+		},
+		{
+			name:      "unparseable value is rejected",
+			cidr:      "not-a-cidr",
+			wantErr:   true,
+			errSubstr: "PAYMENT_GATEWAY_CIDR must be a valid CIDR block",
+		},
+		{
+			name:      "missing prefix length is rejected",
+			cidr:      "10.0.0.0",
+			wantErr:   true,
+			errSubstr: "PAYMENT_GATEWAY_CIDR must be a valid CIDR block",
+		},
+		{
+			name:      "IPv4 wildcard 0.0.0.0/0 is rejected (IP spoofing)",
+			cidr:      "0.0.0.0/0",
+			wantErr:   true,
+			errSubstr: "PAYMENT_GATEWAY_CIDR must not be a wildcard",
+		},
+		{
+			name:      "IPv6 wildcard ::/0 is rejected (IP spoofing)",
+			cidr:      "::/0",
+			wantErr:   true,
+			errSubstr: "PAYMENT_GATEWAY_CIDR must not be a wildcard",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv("PAYMENT_GATEWAY_CIDR", tc.cidr)
+
+			_, err := config.Load()
+			if tc.wantErr {
+				require.Error(t, err, "Load() must fail for GatewayCIDR %q", tc.cidr)
+				assert.Contains(t, err.Error(), tc.errSubstr)
+			} else {
+				require.NoError(t, err, "Load() must succeed for GatewayCIDR %q", tc.cidr)
+			}
+		})
+	}
+}

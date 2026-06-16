@@ -188,6 +188,7 @@ func run() error {
 		Pool:                pool,
 		Redis:               redisClient,
 		GatewayHMACSecret:   cfg.GatewayHMACSecret,
+		GatewayCIDR:         cfg.GatewayCIDR,
 		SettlementS2SToken:  cfg.SettlementS2SToken,
 		UserRateLimitPerMin: cfg.UserRateLimitPerMin,
 		UserRateLimitBurst:  cfg.UserRateLimitBurst,
